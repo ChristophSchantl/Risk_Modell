@@ -517,8 +517,8 @@ for lvl in cfg.levels:
     df_rc = pd.DataFrame({
         "level": lvl,
         "ticker": assets,
-        "RC_VaR_param_EUR": rc_var.values,
-        "RC_ES_param_EUR": rc_es.values,
+        "RC_VaR_param_EUR": rc_var,
+        "RC_ES_param_EUR": rc_es,
     }).sort_values("RC_ES_param_EUR", ascending=False)
 
     df_rc["RC_VaR_share_%"] = 100 * df_rc["RC_VaR_param_EUR"] / (df_rc["RC_VaR_param_EUR"].sum() or 1)
