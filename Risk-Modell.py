@@ -493,10 +493,14 @@ if cfg.horizon_days != 1:
 # -----------------------------
 rc_rows = []
 for lvl in cfg.levels:
-    w = weights[assets]
-    Sigma = cov
-    wv = w.values.reshape(-1, 1)
-    port_var = float(wv.T @ Sigma.values @ wv)
+    # --- FIX: robuste numpy-Matrixrechnung ---
+    w = weights.reindex(assets).astype(float).to_numpy()  # shape (n,)
+    Sigma = cov.reindex(index=assets, columns=assets).astype(float).to_numpy()  # (n,n)
+    
+    Sigma = np.atleast_2d(Sigma)
+    w = np.asarray(w, dtype=float)
+    
+    port_var = float(w @ Sigma @ w)   # korrektes Skalarprodukt
     port_sig = float(np.sqrt(max(port_var, 0.0)))
 
     z = float(norm.ppf(lvl))
