@@ -1,7 +1,11 @@
 # streamlit_app.py
 # ------------------------------------------------------------
-# Quick Portfolio Risk — VaR/Vol, Beta vs S&P500 & DAX, 2W Forecast
-# FIX: Ticker-Liste laden (Text/CSV) -> VOR data_editor in session_state mergen + rerun
+# Quick Portfolio Risk — VaR/Vol, Beta (S&P500/DAX), robust 2W Forecast
+# FIXES:
+# 1) Ticker-Liste (Text/CSV) wird in session_state gemerged + rerun (UI-stabil)
+# 2) Portfolio-Returns robust (kein globales dropna über alle Spalten)
+#    -> tägliche Renormalisierung der Gewichte auf verfügbare Returns
+# 3) Forecast-Minimum dynamisch (max(60, 10*horizon)) statt hart 120
 # ------------------------------------------------------------
 
 import json
@@ -21,6 +25,7 @@ DEFAULT_SPX = "^GSPC"
 DEFAULT_DAX = "^GDAXI"
 DEFAULT_FX  = "EURUSD=X"
 
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -39,6 +44,7 @@ def infer_usd_like(cols: List[str]) -> List[str]:
     for c in cols:
         if c.endswith("=X") or c.startswith("^"):
             continue
+        # Heuristik: US tickers meist ohne ".", viele EU tickers mit ".", z.B. VOW3.DE
         if "." not in c:
             out.append(c)
     return out
@@ -78,9 +84,27 @@ def beta_alpha(port_rets: pd.Series, mkt_rets: pd.Series) -> Tuple[float, float]
     a = float(np.mean(y) - b * np.mean(x))
     return (float(b), float(a))
 
+def portfolio_returns_robust(rets_pos: pd.DataFrame, weights: pd.Series) -> pd.Series:
+    """
+    Robust: nutzt nur verfügbare Returns pro Tag und renormalisiert Gewichte.
+    rets_pos: DataFrame (Spalten = tickers)
+    weights:  Series index = tickers (target weights, z.B. current weights)
+    """
+    rets_pos = rets_pos.copy()
+    weights = weights.reindex(rets_pos.columns)
+
+    avail = rets_pos.notna().astype(float)
+    w_eff = avail.mul(weights.values, axis=1)
+    w_sum = w_eff.sum(axis=1).replace(0.0, np.nan)
+    w_norm = w_eff.div(w_sum, axis=0)
+
+    port = (rets_pos * w_norm).sum(axis=1)
+    return port.dropna()
+
 def bootstrap_forecast(returns: pd.Series, horizon_days: int, n_sims: int, seed: int = 42) -> np.ndarray:
     r = returns.dropna().to_numpy()
-    if r.size < 120:
+    min_points = max(60, 10 * horizon_days)  # dynamisch statt fix 120
+    if r.size < min_points:
         return np.array([])
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, r.size, size=(n_sims, horizon_days))
@@ -92,6 +116,7 @@ def fmt_ccy(x: float) -> str:
 
 def fmt_pct(x: float, dp: int = 2) -> str:
     return "n/a" if pd.isna(x) else f"{x*100:.{dp}f}%"
+
 
 # ----------------------------
 # State I/O
@@ -108,12 +133,15 @@ def _ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["ticker", "shares", "entry", "entry_ccy", "px_override"]:
         if col not in df.columns:
             df[col] = np.nan
+
     df["ticker"] = df["ticker"].map(_norm_ticker)
+    df = df[df["ticker"] != ""].copy()
+
     df["entry_ccy"] = df["entry_ccy"].fillna("USD")
     df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0.0)
     df["entry"] = pd.to_numeric(df["entry"], errors="coerce").fillna(0.0)
     df["px_override"] = pd.to_numeric(df["px_override"], errors="coerce")
-    return df
+    return df.reset_index(drop=True)
 
 def load_state_file() -> Tuple[pd.DataFrame, float]:
     if os.path.exists(STATE_FILE):
@@ -147,7 +175,9 @@ def merge_tickers_into_df(df: pd.DataFrame, tickers: List[str]) -> Tuple[pd.Data
 
     if new_rows:
         df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+        df = _ensure_schema(df)
     return df, len(new_rows)
+
 
 # ----------------------------
 # App
@@ -155,7 +185,7 @@ def merge_tickers_into_df(df: pd.DataFrame, tickers: List[str]) -> Tuple[pd.Data
 st.set_page_config(layout="wide")
 st.title("Quick Portfolio Risk — VaR, Vol, Beta (S&P 500 / DAX), 2-Wochen-Forecast")
 
-# init session state
+# init session state once
 if "df" not in st.session_state or "cash_eur" not in st.session_state:
     df0, cash0 = load_state_file()
     st.session_state.df = df0
@@ -205,7 +235,7 @@ with st.sidebar:
     with colB:
         run = st.button("▶️ Compute", type="primary")
 
-# Editable table (now stable)
+# Editor
 st.subheader("Inputs (editierbar)")
 st.session_state.df = _ensure_schema(st.session_state.df)
 
@@ -222,10 +252,8 @@ edited = st.data_editor(
     }
 )
 
-# commit edits to state
 st.session_state.df = _ensure_schema(edited)
 
-# validate duplicates
 if st.session_state.df["ticker"].duplicated().any():
     st.error("Duplicate tickers – bitte bereinigen.")
     st.stop()
@@ -241,21 +269,23 @@ df = st.session_state.df.copy()
 cash_eur = float(st.session_state.cash_eur)
 
 # ----------------------------
-# Risk Compute
+# Compute Risk
 # ----------------------------
 tickers_all = df["ticker"].tolist()
-
 tickers_pos = df.loc[df["shares"] != 0, "ticker"].tolist()
+
 if len(tickers_pos) == 0:
     st.warning("Keine Positionen mit Shares ≠ 0. Ich rechne Risk für alle Ticker in der Tabelle.")
     tickers_pos = tickers_all.copy()
 
 needed = list(dict.fromkeys(tickers_pos + [DEFAULT_SPX, DEFAULT_DAX] + ([DEFAULT_FX] if use_fx else [])))
 px_all = dl_close(needed)
+
 if px_all.empty:
     st.error("Keine Preisdaten geladen (yfinance).")
     st.stop()
 
+# FX series (EURUSD)
 fx = None
 if use_fx:
     if DEFAULT_FX not in px_all.columns:
@@ -263,6 +293,7 @@ if use_fx:
         st.stop()
     fx = px_all[DEFAULT_FX].dropna()
 
+# prices without FX column
 drop_fx_cols = [DEFAULT_FX] if DEFAULT_FX in px_all.columns else []
 px = px_all.drop(columns=drop_fx_cols).tail(lookback).dropna(how="all")
 
@@ -279,6 +310,7 @@ if len(tickers_use) == 0:
     st.error("Keine gültigen Ticker übrig.")
     st.stop()
 
+# Convert USD-like tickers to EUR price series if FX on (do NOT dropna globally afterwards)
 px_eur = px.copy()
 if use_fx and fx is not None:
     usd_cols = infer_usd_like(px_eur.columns.tolist())
@@ -286,13 +318,16 @@ if use_fx and fx is not None:
     for c in usd_cols:
         if c in px_eur.columns:
             px_eur[c] = px_eur[c] / fx_aligned
-px_eur = px_eur.dropna()
 
-last = px_eur.iloc[-1]
+# last available price per column (use latest row; if some columns NaN at end, ffill)
+px_eur_ffill = px_eur.ffill()
+last = px_eur_ffill.iloc[-1]
 
+# Position table mapped to last prices (EUR)
 df2 = df[df["ticker"].isin(tickers_use)].copy()
 df2["px_eur"] = df2["ticker"].map(last)
 
+# override current prices if provided (interpreted as EUR reporting price)
 override = pd.to_numeric(df2["px_override"], errors="coerce")
 df2.loc[override.notna(), "px_eur"] = override[override.notna()]
 
@@ -301,12 +336,13 @@ total_eur = float(df2["value_eur"].sum() + cash_eur)
 if total_eur <= 0:
     st.error("Total EUR <= 0 (Shares/Prices/Cash prüfen).")
     st.stop()
+
 df2["weight"] = df2["value_eur"] / total_eur
 
 # entry -> EUR for PnL display
 eurusd_last = np.nan
-if use_fx and DEFAULT_FX in px_all.columns and len(px_all[DEFAULT_FX].dropna()) > 0:
-    eurusd_last = float(px_all[DEFAULT_FX].dropna().iloc[-1])
+if use_fx and fx is not None and len(fx) > 0:
+    eurusd_last = float(fx.iloc[-1])
 
 entry_eur = []
 for _, r in df2.iterrows():
@@ -314,26 +350,36 @@ for _, r in df2.iterrows():
     if r["entry_ccy"] == "USD" and use_fx and np.isfinite(eurusd_last) and eurusd_last > 0:
         ep = ep / eurusd_last
     entry_eur.append(ep)
+
 df2["entry_eur"] = entry_eur
 df2["unreal_pnl_eur"] = (df2["px_eur"] - df2["entry_eur"]) * df2["shares"]
 df2["unreal_pnl_pct"] = np.where(df2["entry_eur"] > 0, df2["px_eur"] / df2["entry_eur"] - 1.0, np.nan)
 
-rets = px_eur.pct_change().dropna()
+# Returns (no global dropna!)
+rets_all = px_eur.pct_change()
+
+rets_pos = rets_all[tickers_use]
+spx_rets = rets_all[DEFAULT_SPX].dropna()
+dax_rets = rets_all[DEFAULT_DAX].dropna()
+
+# Portfolio returns robust with daily renormalization
 w = df2.set_index("ticker")["weight"]
-port_rets = (rets[tickers_use] * w).sum(axis=1)
+port_rets = portfolio_returns_robust(rets_pos, w)
 port_pnl = port_rets * total_eur
 
-spx_rets = rets[DEFAULT_SPX]
-dax_rets = rets[DEFAULT_DAX]
-
-b_spx, a_spx = beta_alpha(port_rets, spx_rets)
-b_dax, a_dax = beta_alpha(port_rets, dax_rets)
-
+# risk metrics
 vol_ann = ann_vol(port_rets)
 var_h = var_hist(port_pnl, var_level)
 var_p = var_param(port_pnl, var_level)
-corr = rets[tickers_use].corr()
 
+# beta/alpha (aligned inside beta_alpha)
+b_spx, a_spx = beta_alpha(port_rets, spx_rets)
+b_dax, a_dax = beta_alpha(port_rets, dax_rets)
+
+# correlation on available position returns (pairwise)
+corr = rets_pos.corr()
+
+# forecast
 fc = bootstrap_forecast(port_rets, horizon_days=horizon_days, n_sims=n_sims, seed=42)
 if fc.size:
     fc_mean = float(np.mean(fc))
@@ -370,6 +416,7 @@ st.dataframe(
     use_container_width=True
 )
 
+# Charts
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Equity (norm) & Drawdown")
@@ -427,6 +474,7 @@ with c4:
     plt.tight_layout()
     st.pyplot(fig)
 
+# Forecast
 st.subheader(f"Forecast (Bootstrap) — {horizon_days} Trading Days (~{horizon_days/5:.1f} Wochen)")
 if fc.size:
     f1, f2, f3, f4 = st.columns(4)
@@ -441,4 +489,13 @@ if fc.size:
     plt.tight_layout()
     st.pyplot(fig)
 else:
-    st.info("Zu wenig Historie für Forecast (mind. ~120 Return-Punkte empfohlen).")
+    min_points = max(60, 10 * horizon_days)
+    st.info(f"Zu wenig Historie für Forecast (mind. ~{min_points} Return-Punkte).")
+
+# Bench exposure summary
+st.subheader("Benchmark Exposure (daily)")
+bm1, bm2, bm3, bm4 = st.columns(4)
+bm1.metric("Alpha vs S&P (daily)", fmt_pct(a_spx, 3) if np.isfinite(a_spx) else "n/a")
+bm2.metric("Alpha vs DAX (daily)", fmt_pct(a_dax, 3) if np.isfinite(a_dax) else "n/a")
+bm3.metric("Corr (Port, S&P)", f"{port_rets.corr(spx_rets):.2f}" if len(pd.concat([port_rets, spx_rets], axis=1).dropna()) > 60 else "n/a")
+bm4.metric("Corr (Port, DAX)", f"{port_rets.corr(dax_rets):.2f}" if len(pd.concat([port_rets, dax_rets], axis=1).dropna()) > 60 else "n/a")
