@@ -1,15 +1,12 @@
 # streamlit_app.py
 # ------------------------------------------------------------
 # Quick Portfolio Risk — VaR/Vol, Beta vs S&P500 & DAX, 2W Forecast
-# Inputs: ticker, shares, entry, optional manual current price
-# Currency: optional USD->EUR conversion via EURUSD=X
-# Data: yfinance (Adj Close / auto_adjust)
+# + Ticker-Liste laden (Text / CSV) und automatisch in die Tabelle übernehmen
 # ------------------------------------------------------------
 
 import json
 import os
-from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,11 +32,11 @@ def dl_close(tickers: List[str]) -> pd.DataFrame:
     return px
 
 def infer_usd_like(cols: List[str]) -> List[str]:
-    # Heuristik: US Ticker haben i.d.R. kein "."; FX & Indizes ausnehmen
     out = []
     for c in cols:
         if c.endswith("=X") or c.startswith("^"):
             continue
+        # US tickers usually have no ".", while many EU tickers do (e.g. VOW3.DE)
         if "." not in c:
             out.append(c)
     return out
@@ -54,11 +51,17 @@ def var_param(pnl: pd.Series, level: float) -> float:
     x = pnl.dropna().to_numpy()
     if x.size < 60:
         return np.nan
-    mu, sig = float(np.mean(x)), float(np.std(x, ddof=1))
+    mu = float(np.mean(x))
+    sig = float(np.std(x, ddof=1))
+    if not np.isfinite(sig) or sig <= 0:
+        return np.nan
     return max(0.0, norm.ppf(level) * sig - mu)
 
 def ann_vol(rets: pd.Series) -> float:
-    return float(rets.std(ddof=1) * np.sqrt(252))
+    x = rets.dropna()
+    if len(x) < 60:
+        return np.nan
+    return float(x.std(ddof=1) * np.sqrt(252))
 
 def beta_alpha(port_rets: pd.Series, mkt_rets: pd.Series) -> Tuple[float, float]:
     df = pd.concat([port_rets, mkt_rets], axis=1).dropna()
@@ -80,7 +83,6 @@ def bootstrap_forecast(returns: pd.Series, horizon_days: int, n_sims: int, seed:
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, r.size, size=(n_sims, horizon_days))
     sims = r[idx]
-    # compounded return over horizon
     cum = np.prod(1.0 + sims, axis=1) - 1.0
     return cum
 
@@ -95,19 +97,18 @@ def fmt_pct(x: float, dp: int = 2) -> str:
     return f"{x*100:.{dp}f}%"
 
 # ----------------------------
-# Defaults
+# Defaults / State
 # ----------------------------
 DEFAULT_PORT = pd.DataFrame([
-    {"ticker": "REI",    "shares": 1000.0, "entry": 0.72,   "entry_ccy": "USD", "px_override": np.nan},
-    {"ticker": "PYPL",   "shares": 50.0,   "entry": 62.10,  "entry_ccy": "USD", "px_override": np.nan},
-    {"ticker": "NVO",    "shares": 60.0,   "entry": 36.50,  "entry_ccy": "USD", "px_override": np.nan},
-    {"ticker": "VOW3.DE","shares": 20.0,   "entry": 120.0,  "entry_ccy": "EUR", "px_override": np.nan},
+    {"ticker": "AAPL",   "shares": 50.0,   "entry": 180.0, "entry_ccy": "USD", "px_override": np.nan},
+    {"ticker": "MSFT",   "shares": 20.0,   "entry": 350.0, "entry_ccy": "USD", "px_override": np.nan},
+    {"ticker": "VOW3.DE","shares": 20.0,   "entry": 120.0, "entry_ccy": "EUR", "px_override": np.nan},
 ])
 DEFAULT_CASH_EUR = 10_000.0
 
 DEFAULT_SPX = "^GSPC"
 DEFAULT_DAX = "^GDAXI"
-DEFAULT_FX = "EURUSD=X"
+DEFAULT_FX  = "EURUSD=X"
 
 def load_state() -> Tuple[pd.DataFrame, float]:
     if os.path.exists(STATE_FILE):
@@ -115,7 +116,12 @@ def load_state() -> Tuple[pd.DataFrame, float]:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
             df = pd.DataFrame(d["portfolio"])
-            cash = float(d["cash_eur"])
+            cash = float(d.get("cash_eur", DEFAULT_CASH_EUR))
+            # Basic schema fallback
+            for col in ["ticker", "shares", "entry", "entry_ccy", "px_override"]:
+                if col not in df.columns:
+                    df[col] = np.nan
+            df["ticker"] = df["ticker"].map(_norm_ticker)
             return df, cash
         except Exception:
             pass
@@ -127,30 +133,61 @@ def save_state(df: pd.DataFrame, cash_eur: float) -> None:
         json.dump(payload, f, indent=2)
 
 # ----------------------------
-# Streamlit UI
+# App
 # ----------------------------
 st.set_page_config(layout="wide")
 st.title("Quick Portfolio Risk — VaR, Vol, Beta (S&P 500 / DAX), 2-Wochen-Forecast")
 
 df, cash_eur = load_state()
 
+# ---- Sidebar controls (incl. ticker list loader)
 with st.sidebar:
-    st.header("Settings")
+    st.header("Parameter")
     lookback = st.slider("Lookback (Trading Days)", 252, 1500, 756, step=21)
     var_level = st.selectbox("VaR Level", [0.90, 0.95, 0.975, 0.99], index=1)
     horizon_days = st.selectbox("Forecast Horizon", [5, 10, 15], index=1)  # 10 ~ 2 Wochen
     n_sims = st.slider("Forecast Sims", 500, 20000, 5000, step=500)
     use_fx = st.checkbox("USD → EUR umrechnen (EURUSD=X)", value=True)
     cash_eur = st.number_input("Cash (EUR)", value=float(cash_eur), step=1000.0)
-    col_s1, col_s2 = st.columns(2)
-    with col_s1:
-        if st.button("💾 Save Inputs"):
-            save_state(df, cash_eur)
-            st.success("Saved")
-    with col_s2:
+
+    st.divider()
+    st.header("Ticker laden")
+    ticker_source = st.radio("Ticker-Eingabe", ["Manuell (Tabelle)", "Liste (Text/CSV)"], index=0)
+
+    uploaded_tickers: List[str] = []
+    if ticker_source == "Liste (Text/CSV)":
+        st.caption("Ticker kommasepariert oder CSV mit Spalte 'ticker' (oder erste Spalte).")
+        tickers_text = st.text_area("Ticker-Liste", placeholder="AAPL, MSFT, NVDA, VOW3.DE")
+        upload = st.file_uploader("CSV Upload", type=["csv"])
+
+        if tickers_text and tickers_text.strip():
+            uploaded_tickers = [_norm_ticker(t) for t in tickers_text.split(",") if t.strip()]
+
+        if upload is not None:
+            try:
+                csv = pd.read_csv(upload)
+                col = "ticker" if "ticker" in csv.columns else csv.columns[0]
+                uploaded_tickers = [_norm_ticker(t) for t in csv[col].dropna().tolist()]
+            except Exception as e:
+                st.error(f"CSV konnte nicht gelesen werden: {e}")
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        save_btn = st.button("💾 Save Inputs")
+    with c2:
         run = st.button("▶️ Compute", type="primary")
 
+# ---- Editable inputs table
 st.subheader("Inputs (editierbar)")
+
+# Ensure required cols exist before editor
+for col in ["ticker", "shares", "entry", "entry_ccy", "px_override"]:
+    if col not in df.columns:
+        df[col] = np.nan
+df["ticker"] = df["ticker"].map(_norm_ticker)
+df["entry_ccy"] = df["entry_ccy"].fillna("USD")
+
 df = st.data_editor(
     df,
     use_container_width=True,
@@ -164,12 +201,38 @@ df = st.data_editor(
     }
 ).copy()
 
-df["ticker"] = df["ticker"].map(_norm_ticker)
-df = df[df["ticker"] != ""].dropna(subset=["shares", "entry", "entry_ccy"], how="any").copy()
+# ---- Merge uploaded tickers into df (after editor)
+if ticker_source == "Liste (Text/CSV)" and uploaded_tickers:
+    existing = set(df["ticker"].dropna().map(_norm_ticker))
+    new_rows = []
+    for t in uploaded_tickers:
+        if t and t not in existing:
+            new_rows.append({
+                "ticker": t,
+                "shares": 0.0,
+                "entry": 0.0,
+                "entry_ccy": "USD",
+                "px_override": np.nan
+            })
+    if new_rows:
+        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+        st.info(f"{len(new_rows)} Ticker aus Liste hinzugefügt. Bitte Shares/Entry ergänzen (oder 0 lassen).")
 
+# Clean df
+df["ticker"] = df["ticker"].map(_norm_ticker)
+df = df[df["ticker"] != ""].copy()
+df["shares"] = pd.to_numeric(df["shares"], errors="coerce").fillna(0.0)
+df["entry"] = pd.to_numeric(df["entry"], errors="coerce").fillna(0.0)
+df["px_override"] = pd.to_numeric(df["px_override"], errors="coerce")
+
+# Validate duplicates
 if df.duplicated("ticker").any():
     st.error("Duplicate tickers – bitte bereinigen.")
     st.stop()
+
+if save_btn:
+    save_state(df, cash_eur)
+    st.success("Saved")
 
 if not run:
     st.stop()
@@ -178,7 +241,14 @@ if not run:
 # Data & Valuation
 # ----------------------------
 tickers = df["ticker"].tolist()
-needed = list(dict.fromkeys(tickers + [DEFAULT_SPX, DEFAULT_DAX] + ([DEFAULT_FX] if use_fx else [])))
+
+# use only tickers with non-zero shares for risk (optional); you can include 0-share tickers if you want watchlist risk
+tickers_pos = df.loc[df["shares"] != 0, "ticker"].tolist()
+if len(tickers_pos) == 0:
+    st.warning("Keine Positionen mit Shares ≠ 0. Ich rechne Risk für alle Ticker in der Tabelle.")
+    tickers_pos = tickers.copy()
+
+needed = list(dict.fromkeys(tickers_pos + [DEFAULT_SPX, DEFAULT_DAX] + ([DEFAULT_FX] if use_fx else [])))
 px_all = dl_close(needed)
 
 if px_all.empty:
@@ -194,17 +264,18 @@ if use_fx:
     fx = px_all[DEFAULT_FX].dropna()
 
 # Price table for tickers & benchmarks
-px = px_all.drop(columns=[c for c in [DEFAULT_FX] if c in px_all.columns]).copy()
+drop_fx_cols = [DEFAULT_FX] if DEFAULT_FX in px_all.columns else []
+px = px_all.drop(columns=drop_fx_cols).copy()
 px = px.dropna(how="all")
 px = px.tail(lookback)
 
-# enforce availability
+# Check availability
 have = set(px.columns)
-missing = [t for t in tickers if t not in have]
+missing = [t for t in tickers_pos if t not in have]
 if missing:
     st.warning(f"Fehlende Ticker in Daten (werden ignoriert): {', '.join(missing)}")
 
-tickers_use = [t for t in tickers if t in have]
+tickers_use = [t for t in tickers_pos if t in have]
 if DEFAULT_SPX not in have or DEFAULT_DAX not in have:
     st.error("S&P 500 (^GSPC) oder DAX (^GDAXI) fehlen in Daten.")
     st.stop()
@@ -224,25 +295,31 @@ if use_fx and fx is not None:
 
 px_eur = px_eur.dropna()
 
-# latest prices (EUR where applicable)
 last = px_eur.iloc[-1].copy()
 
+# Keep only rows used in portfolio risk
 df2 = df[df["ticker"].isin(tickers_use)].copy()
 df2["px_eur"] = df2["ticker"].map(last)
 
-# manual override of current price (interpret as EUR if FX active; otherwise as native)
+# Manual override of current price (interpreted as EUR in the reporting currency)
 override = pd.to_numeric(df2["px_override"], errors="coerce")
 df2.loc[override.notna(), "px_eur"] = override[override.notna()]
 
 df2["value_eur"] = df2["px_eur"] * df2["shares"]
+
 total_eur = float(df2["value_eur"].sum() + cash_eur)
+if total_eur <= 0:
+    st.error("Total EUR <= 0 (Shares/Prices/Cash prüfen).")
+    st.stop()
+
 df2["weight"] = df2["value_eur"] / total_eur
 
-# entry price in EUR for unrealized P&L
-if use_fx and fx is not None:
-    eurusd_last = float(px_all[DEFAULT_FX].dropna().iloc[-1])
-else:
-    eurusd_last = np.nan
+# Entry price in EUR for unrealized P&L
+eurusd_last = np.nan
+if use_fx and DEFAULT_FX in px_all.columns:
+    s = px_all[DEFAULT_FX].dropna()
+    if len(s) > 0:
+        eurusd_last = float(s.iloc[-1])
 
 entry_eur = []
 for _, r in df2.iterrows():
@@ -253,14 +330,17 @@ for _, r in df2.iterrows():
 
 df2["entry_eur"] = entry_eur
 df2["unreal_pnl_eur"] = (df2["px_eur"] - df2["entry_eur"]) * df2["shares"]
-df2["unreal_pnl_pct"] = df2["px_eur"] / df2["entry_eur"] - 1.0
+df2["unreal_pnl_pct"] = np.where(df2["entry_eur"] > 0, df2["px_eur"] / df2["entry_eur"] - 1.0, np.nan)
 
 # ----------------------------
 # Returns & Risk
 # ----------------------------
 rets = px_eur.pct_change().dropna()
 
-port_rets = (rets[tickers_use] * df2.set_index("ticker")["weight"]).sum(axis=1)
+# Portfolio returns using current weights (incl. cash as 0-return)
+w = df2.set_index("ticker")["weight"]
+port_rets = (rets[tickers_use] * w).sum(axis=1)
+
 port_pnl = port_rets * total_eur
 
 spx_rets = rets[DEFAULT_SPX]
@@ -281,12 +361,11 @@ if fc.size:
     fc_mean = float(np.mean(fc))
     fc_q05 = float(np.quantile(fc, 0.05))
     fc_q95 = float(np.quantile(fc, 0.95))
-    # translate to EUR
     fc_pnl_mean = fc_mean * total_eur
-    fc_pnl_var = max(0.0, -fc_q05 * total_eur)   # 95% one-sided loss proxy
+    fc_pnl_var_like = max(0.0, -fc_q05 * total_eur)  # one-sided loss proxy
 else:
     fc_mean = fc_q05 = fc_q95 = np.nan
-    fc_pnl_mean = fc_pnl_var = np.nan
+    fc_pnl_mean = fc_pnl_var_like = np.nan
 
 # ----------------------------
 # Output: Key Metrics
@@ -330,7 +409,7 @@ with c1:
     dd = equity / equity.cummax() - 1.0
 
     fig = plt.figure()
-    plt.plot(equity.index, equity.values, label="Equity")
+    plt.plot(equity.index, equity.values)
     plt.title("Portfolio Equity (normalized)")
     plt.tight_layout()
     st.pyplot(fig)
@@ -359,10 +438,10 @@ c3, c4 = st.columns(2)
 
 with c3:
     st.subheader("Beta Check (Scatter)")
-    fig = plt.figure()
     df_sc = pd.concat([port_rets, spx_rets, dax_rets], axis=1).dropna()
     df_sc.columns = ["port", "spx", "dax"]
 
+    fig = plt.figure()
     plt.scatter(df_sc["spx"], df_sc["port"], s=10)
     plt.title(f"Port vs S&P500 (beta≈{b_spx:.2f})")
     plt.tight_layout()
@@ -393,7 +472,7 @@ if fc.size:
     f1.metric("Expected Return", fmt_pct(fc_mean))
     f2.metric("5% Quantile Return", fmt_pct(fc_q05))
     f3.metric("95% Quantile Return", fmt_pct(fc_q95))
-    f4.metric("Loss Proxy (VaR-like, EUR)", fmt_ccy(fc_pnl_var))
+    f4.metric("Loss Proxy (VaR-like, EUR)", fmt_ccy(fc_pnl_var_like))
 
     fig = plt.figure()
     plt.hist(fc, bins=50)
@@ -402,3 +481,13 @@ if fc.size:
     st.pyplot(fig)
 else:
     st.info("Zu wenig Historie für Forecast (mind. ~120 Return-Punkte empfohlen).")
+
+# ----------------------------
+# Extra: Benchmark summary (optional)
+# ----------------------------
+st.subheader("Benchmark Exposure (daily)")
+bm1, bm2, bm3, bm4 = st.columns(4)
+bm1.metric("Alpha vs S&P (daily)", fmt_pct(a_spx, 3) if np.isfinite(a_spx) else "n/a")
+bm2.metric("Alpha vs DAX (daily)", fmt_pct(a_dax, 3) if np.isfinite(a_dax) else "n/a")
+bm3.metric("Corr (Port, S&P)", f"{port_rets.corr(spx_rets):.2f}" if len(pd.concat([port_rets, spx_rets], axis=1).dropna()) > 60 else "n/a")
+bm4.metric("Corr (Port, DAX)", f"{port_rets.corr(dax_rets):.2f}" if len(pd.concat([port_rets, dax_rets], axis=1).dropna()) > 60 else "n/a")
