@@ -1,16 +1,19 @@
 # streamlit_app.py
 # ------------------------------------------------------------
 # Quick Portfolio Risk — VaR/Vol, Beta (S&P500/DAX), robust 2W Forecast
-# FIXES:
-# 1) Ticker-Liste (Text/CSV) wird in session_state gemerged + rerun (UI-stabil)
-# 2) Portfolio-Returns robust (kein globales dropna über alle Spalten)
-#    -> tägliche Renormalisierung der Gewichte auf verfügbare Returns
-# 3) Forecast-Minimum dynamisch (max(60, 10*horizon)) statt hart 120
+# Robust & Stable Version
+#
+# Key Fixes:
+# - yfinance download normalization: works with Series / DataFrame / MultiIndex
+# - Portfolio returns robust (daily weight renorm, no global dropna)
+# - Forecast minimum dynamic
+# - Stable Streamlit editor state (key + session_state as source of truth)
+# - Better diagnostics (missing tickers, history length)
 # ------------------------------------------------------------
 
 import json
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -25,26 +28,108 @@ DEFAULT_SPX = "^GSPC"
 DEFAULT_DAX = "^GDAXI"
 DEFAULT_FX  = "EURUSD=X"
 
-
 # ----------------------------
 # Helpers
 # ----------------------------
 def _norm_ticker(x: str) -> str:
     return str(x or "").strip().upper()
 
-@st.cache_data(ttl=1800)
+def _dedup_keep_order(xs: List[str]) -> List[str]:
+    out, seen = [], set()
+    for x in xs:
+        x = _norm_ticker(x)
+        if not x:
+            continue
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def dl_close(tickers: List[str]) -> pd.DataFrame:
-    px = yf.download(tickers=tickers, auto_adjust=True, progress=False)["Close"]
-    if isinstance(px, pd.Series):
-        px = px.to_frame()
-    return px.dropna(how="all")
+    """
+    Robust yfinance close loader:
+    - Handles Series vs DataFrame
+    - Handles MultiIndex columns (common with yf.download)
+    - Returns DataFrame indexed by date with columns=tickers
+    """
+    tickers = _dedup_keep_order(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
+    data = yf.download(
+        tickers=tickers,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",     # still may return MultiIndex depending on yf version
+        threads=True
+    )
+
+    if data is None or len(data) == 0:
+        return pd.DataFrame()
+
+    # If Series (single ticker edge)
+    if isinstance(data, pd.Series):
+        # rare edge: if returned series is Close
+        return data.to_frame(name=tickers[0]).dropna(how="all")
+
+    # If columns are MultiIndex: typically ("Close", "AAPL") or ("AAPL","Close")
+    if isinstance(data.columns, pd.MultiIndex):
+        # Case A: first level contains OHLC like "Close"
+        if "Close" in data.columns.get_level_values(0):
+            close = data["Close"].copy()
+            if isinstance(close, pd.Series):
+                close = close.to_frame()
+            close.columns = [str(c) for c in close.columns]
+            return close.dropna(how="all")
+
+        # Case B: first level contains tickers
+        lvl0 = list(map(str, data.columns.get_level_values(0)))
+        # try: for each ticker take subcolumn "Close"
+        out = {}
+        for t in tickers:
+            if t in lvl0:
+                try:
+                    sub = data[t]
+                    if isinstance(sub, pd.DataFrame) and "Close" in sub.columns:
+                        out[t] = sub["Close"]
+                except Exception:
+                    pass
+        if out:
+            close = pd.DataFrame(out)
+            return close.dropna(how="all")
+
+        # fallback: attempt to find any column with name close-ish
+        # (very defensive)
+        flat = data.copy()
+        flat.columns = ["|".join(map(str, c)) for c in flat.columns]
+        close_cols = [c for c in flat.columns if c.lower().endswith("|close") or c.lower().startswith("close|")]
+        if close_cols:
+            tmp = flat[close_cols].copy()
+            tmp.columns = [c.split("|")[-1] if c.lower().startswith("close|") else c.split("|")[0] for c in close_cols]
+            return tmp.dropna(how="all")
+
+        return pd.DataFrame()
+
+    # Standard DataFrame with single-level columns
+    if "Close" in data.columns:
+        close = data["Close"]
+        if isinstance(close, pd.Series):
+            close = close.to_frame(name=tickers[0])
+        close.columns = [str(c) for c in close.columns]
+        return close.dropna(how="all")
+
+    # If already close-like (columns are tickers)
+    data.columns = [str(c) for c in data.columns]
+    return data.dropna(how="all")
+
 
 def infer_usd_like(cols: List[str]) -> List[str]:
     out = []
     for c in cols:
         if c.endswith("=X") or c.startswith("^"):
             continue
-        # Heuristik: US tickers meist ohne ".", viele EU tickers mit ".", z.B. VOW3.DE
+        # heuristic: US tickers usually without "."
         if "." not in c:
             out.append(c)
     return out
@@ -86,15 +171,17 @@ def beta_alpha(port_rets: pd.Series, mkt_rets: pd.Series) -> Tuple[float, float]
 
 def portfolio_returns_robust(rets_pos: pd.DataFrame, weights: pd.Series) -> pd.Series:
     """
-    Robust: nutzt nur verfügbare Returns pro Tag und renormalisiert Gewichte.
-    rets_pos: DataFrame (Spalten = tickers)
-    weights:  Series index = tickers (target weights, z.B. current weights)
+    Robust daily weighting:
+    - uses only available returns per day
+    - renormalizes weights across available assets
     """
-    rets_pos = rets_pos.copy()
-    weights = weights.reindex(rets_pos.columns)
+    if rets_pos.empty:
+        return pd.Series(dtype=float)
+    weights = weights.reindex(rets_pos.columns).fillna(0.0)
 
     avail = rets_pos.notna().astype(float)
     w_eff = avail.mul(weights.values, axis=1)
+
     w_sum = w_eff.sum(axis=1).replace(0.0, np.nan)
     w_norm = w_eff.div(w_sum, axis=0)
 
@@ -103,7 +190,7 @@ def portfolio_returns_robust(rets_pos: pd.DataFrame, weights: pd.Series) -> pd.S
 
 def bootstrap_forecast(returns: pd.Series, horizon_days: int, n_sims: int, seed: int = 42) -> np.ndarray:
     r = returns.dropna().to_numpy()
-    min_points = max(60, 10 * horizon_days)  # dynamisch statt fix 120
+    min_points = max(60, 10 * int(horizon_days))
     if r.size < min_points:
         return np.array([])
     rng = np.random.default_rng(seed)
@@ -117,14 +204,13 @@ def fmt_ccy(x: float) -> str:
 def fmt_pct(x: float, dp: int = 2) -> str:
     return "n/a" if pd.isna(x) else f"{x*100:.{dp}f}%"
 
-
 # ----------------------------
 # State I/O
 # ----------------------------
 DEFAULT_PORT = pd.DataFrame([
-    {"ticker": "AAPL",   "shares": 50.0, "entry": 180.0, "entry_ccy": "USD", "px_override": np.nan},
-    {"ticker": "MSFT",   "shares": 20.0, "entry": 350.0, "entry_ccy": "USD", "px_override": np.nan},
-    {"ticker": "VOW3.DE","shares": 20.0, "entry": 120.0, "entry_ccy": "EUR", "px_override": np.nan},
+    {"ticker": "AAPL",    "shares": 50.0, "entry": 180.0, "entry_ccy": "USD", "px_override": np.nan},
+    {"ticker": "MSFT",    "shares": 20.0, "entry": 350.0, "entry_ccy": "USD", "px_override": np.nan},
+    {"ticker": "VOW3.DE", "shares": 20.0, "entry": 120.0, "entry_ccy": "EUR", "px_override": np.nan},
 ])
 DEFAULT_CASH_EUR = 10_000.0
 
@@ -148,7 +234,7 @@ def load_state_file() -> Tuple[pd.DataFrame, float]:
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            df = _ensure_schema(pd.DataFrame(d["portfolio"]))
+            df = _ensure_schema(pd.DataFrame(d.get("portfolio", [])))
             cash = float(d.get("cash_eur", DEFAULT_CASH_EUR))
             return df, cash
         except Exception:
@@ -162,11 +248,11 @@ def save_state_file(df: pd.DataFrame, cash_eur: float) -> None:
 
 def merge_tickers_into_df(df: pd.DataFrame, tickers: List[str]) -> Tuple[pd.DataFrame, int]:
     df = _ensure_schema(df)
-    tickers = [_norm_ticker(t) for t in (tickers or []) if str(t).strip()]
+    tickers = _dedup_keep_order(tickers)
     if not tickers:
         return df, 0
 
-    existing = set(df["ticker"].dropna().map(_norm_ticker))
+    existing = set(df["ticker"].tolist())
     new_rows = []
     for t in tickers:
         if t and t not in existing:
@@ -178,20 +264,17 @@ def merge_tickers_into_df(df: pd.DataFrame, tickers: List[str]) -> Tuple[pd.Data
         df = _ensure_schema(df)
     return df, len(new_rows)
 
-
 # ----------------------------
 # App
 # ----------------------------
 st.set_page_config(layout="wide")
 st.title("Quick Portfolio Risk — VaR, Vol, Beta (S&P 500 / DAX), 2-Wochen-Forecast")
 
-# init session state once
 if "df" not in st.session_state or "cash_eur" not in st.session_state:
     df0, cash0 = load_state_file()
     st.session_state.df = df0
     st.session_state.cash_eur = cash0
 
-# Sidebar
 with st.sidebar:
     st.header("Parameter")
     lookback = st.slider("Lookback (Trading Days)", 252, 1500, 756, step=21)
@@ -223,10 +306,13 @@ with st.sidebar:
                 st.error(f"CSV konnte nicht gelesen werden: {e}")
 
         apply_list = st.button("➕ Ticker in Tabelle übernehmen", type="secondary")
-        if apply_list and uploaded_tickers:
-            st.session_state.df, added = merge_tickers_into_df(st.session_state.df, uploaded_tickers)
-            st.success(f"{added} Ticker hinzugefügt.")
-            st.rerun()
+        if apply_list:
+            if not uploaded_tickers:
+                st.warning("Keine Ticker gefunden (Textfeld/CSV prüfen).")
+            else:
+                st.session_state.df, added = merge_tickers_into_df(st.session_state.df, uploaded_tickers)
+                st.success(f"{added} Ticker hinzugefügt.")
+                st.rerun()
 
     st.divider()
     colA, colB = st.columns(2)
@@ -235,7 +321,6 @@ with st.sidebar:
     with colB:
         run = st.button("▶️ Compute", type="primary")
 
-# Editor
 st.subheader("Inputs (editierbar)")
 st.session_state.df = _ensure_schema(st.session_state.df)
 
@@ -243,6 +328,7 @@ edited = st.data_editor(
     st.session_state.df,
     use_container_width=True,
     num_rows="dynamic",
+    key="portfolio_editor",  # stabilisiert Editor-State
     column_config={
         "ticker": st.column_config.TextColumn("Ticker"),
         "shares": st.column_config.NumberColumn("Shares", step=1.0),
@@ -251,7 +337,6 @@ edited = st.data_editor(
         "px_override": st.column_config.NumberColumn("Current Price Override (optional)", step=0.01),
     }
 )
-
 st.session_state.df = _ensure_schema(edited)
 
 if st.session_state.df["ticker"].duplicated().any():
@@ -259,7 +344,7 @@ if st.session_state.df["ticker"].duplicated().any():
     st.stop()
 
 if save_btn:
-    save_state_file(st.session_state.df, st.session_state.cash_eur)
+    save_state_file(st.session_state.df, float(st.session_state.cash_eur))
     st.success("Saved.")
 
 if not run:
@@ -273,19 +358,18 @@ cash_eur = float(st.session_state.cash_eur)
 # ----------------------------
 tickers_all = df["ticker"].tolist()
 tickers_pos = df.loc[df["shares"] != 0, "ticker"].tolist()
-
 if len(tickers_pos) == 0:
     st.warning("Keine Positionen mit Shares ≠ 0. Ich rechne Risk für alle Ticker in der Tabelle.")
     tickers_pos = tickers_all.copy()
 
-needed = list(dict.fromkeys(tickers_pos + [DEFAULT_SPX, DEFAULT_DAX] + ([DEFAULT_FX] if use_fx else [])))
+needed = _dedup_keep_order(tickers_pos + [DEFAULT_SPX, DEFAULT_DAX] + ([DEFAULT_FX] if use_fx else []))
 px_all = dl_close(needed)
 
 if px_all.empty:
     st.error("Keine Preisdaten geladen (yfinance).")
     st.stop()
 
-# FX series (EURUSD)
+# FX series
 fx = None
 if use_fx:
     if DEFAULT_FX not in px_all.columns:
@@ -293,9 +377,9 @@ if use_fx:
         st.stop()
     fx = px_all[DEFAULT_FX].dropna()
 
-# prices without FX column
-drop_fx_cols = [DEFAULT_FX] if DEFAULT_FX in px_all.columns else []
-px = px_all.drop(columns=drop_fx_cols).tail(lookback).dropna(how="all")
+# remove FX from price table for further steps
+px = px_all.drop(columns=[c for c in [DEFAULT_FX] if c in px_all.columns]).copy()
+px = px.tail(lookback).dropna(how="all")
 
 have = set(px.columns)
 missing = [t for t in tickers_pos if t not in have]
@@ -303,33 +387,42 @@ if missing:
     st.warning(f"Fehlende Ticker in Daten (ignoriert): {', '.join(missing)}")
 
 tickers_use = [t for t in tickers_pos if t in have]
+
 if DEFAULT_SPX not in have or DEFAULT_DAX not in have:
     st.error("S&P (^GSPC) oder DAX (^GDAXI) fehlen.")
     st.stop()
+
 if len(tickers_use) == 0:
-    st.error("Keine gültigen Ticker übrig.")
+    st.error("Keine gültigen Positions-Ticker übrig.")
     st.stop()
 
-# Convert USD-like tickers to EUR price series if FX on (do NOT dropna globally afterwards)
+# Convert USD-like to EUR prices if FX on (no global dropna!)
 px_eur = px.copy()
-if use_fx and fx is not None:
+if use_fx and fx is not None and len(fx) > 0:
     usd_cols = infer_usd_like(px_eur.columns.tolist())
     fx_aligned = fx.reindex(px_eur.index).ffill()
     for c in usd_cols:
         if c in px_eur.columns:
             px_eur[c] = px_eur[c] / fx_aligned
 
-# last available price per column (use latest row; if some columns NaN at end, ffill)
+# last prices: forward-fill to avoid NaN last row per asset
 px_eur_ffill = px_eur.ffill()
 last = px_eur_ffill.iloc[-1]
 
-# Position table mapped to last prices (EUR)
+# position table
 df2 = df[df["ticker"].isin(tickers_use)].copy()
 df2["px_eur"] = df2["ticker"].map(last)
 
-# override current prices if provided (interpreted as EUR reporting price)
+# override current price if provided
 override = pd.to_numeric(df2["px_override"], errors="coerce")
 df2.loc[override.notna(), "px_eur"] = override[override.notna()]
+
+# defensive: drop rows where price missing (otherwise weights become NaN)
+bad_px = df2["px_eur"].isna()
+if bad_px.any():
+    dropped = df2.loc[bad_px, "ticker"].tolist()
+    df2 = df2.loc[~bad_px].copy()
+    st.warning(f"Letzte Preise fehlen (Positionen entfernt): {', '.join(dropped)}")
 
 df2["value_eur"] = df2["px_eur"] * df2["shares"]
 total_eur = float(df2["value_eur"].sum() + cash_eur)
@@ -339,7 +432,7 @@ if total_eur <= 0:
 
 df2["weight"] = df2["value_eur"] / total_eur
 
-# entry -> EUR for PnL display
+# entry -> EUR for display
 eurusd_last = np.nan
 if use_fx and fx is not None and len(fx) > 0:
     eurusd_last = float(fx.iloc[-1])
@@ -355,28 +448,27 @@ df2["entry_eur"] = entry_eur
 df2["unreal_pnl_eur"] = (df2["px_eur"] - df2["entry_eur"]) * df2["shares"]
 df2["unreal_pnl_pct"] = np.where(df2["entry_eur"] > 0, df2["px_eur"] / df2["entry_eur"] - 1.0, np.nan)
 
-# Returns (no global dropna!)
+# returns (no global dropna)
 rets_all = px_eur.pct_change()
 
-rets_pos = rets_all[tickers_use]
+# positions returns
+rets_pos = rets_all[df2["ticker"].tolist()]  # use only tickers that survived price mapping
 spx_rets = rets_all[DEFAULT_SPX].dropna()
 dax_rets = rets_all[DEFAULT_DAX].dropna()
 
-# Portfolio returns robust with daily renormalization
+# portfolio returns robust
 w = df2.set_index("ticker")["weight"]
 port_rets = portfolio_returns_robust(rets_pos, w)
 port_pnl = port_rets * total_eur
 
-# risk metrics
+# metrics
 vol_ann = ann_vol(port_rets)
 var_h = var_hist(port_pnl, var_level)
 var_p = var_param(port_pnl, var_level)
 
-# beta/alpha (aligned inside beta_alpha)
 b_spx, a_spx = beta_alpha(port_rets, spx_rets)
 b_dax, a_dax = beta_alpha(port_rets, dax_rets)
 
-# correlation on available position returns (pairwise)
 corr = rets_pos.corr()
 
 # forecast
@@ -428,12 +520,14 @@ with c1:
     plt.title("Portfolio Equity (normalized)")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
     fig = plt.figure()
     plt.plot(dd.index, dd.values)
     plt.title("Drawdown")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 with c2:
     st.subheader("PnL Distribution (1D) + VaR")
@@ -445,6 +539,7 @@ with c2:
     plt.title(f"Daily PnL (EUR) — VaR {int(var_level*100)}% (hist) marked")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 c3, c4 = st.columns(2)
 with c3:
@@ -457,12 +552,14 @@ with c3:
     plt.title(f"Port vs S&P500 (beta≈{b_spx:.2f})")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
     fig = plt.figure()
     plt.scatter(df_sc["dax"], df_sc["port"], s=10)
     plt.title(f"Port vs DAX (beta≈{b_dax:.2f})")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 with c4:
     st.subheader("Correlation (Positions)")
@@ -473,9 +570,11 @@ with c4:
     plt.colorbar()
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 
 # Forecast
 st.subheader(f"Forecast (Bootstrap) — {horizon_days} Trading Days (~{horizon_days/5:.1f} Wochen)")
+min_points = max(60, 10 * int(horizon_days))
 if fc.size:
     f1, f2, f3, f4 = st.columns(4)
     f1.metric("Expected Return", fmt_pct(fc_mean))
@@ -488,9 +587,18 @@ if fc.size:
     plt.title("Forecast Distribution (Horizon Return)")
     plt.tight_layout()
     st.pyplot(fig)
+    plt.close(fig)
 else:
-    min_points = max(60, 10 * horizon_days)
     st.info(f"Zu wenig Historie für Forecast (mind. ~{min_points} Return-Punkte).")
+
+# Diagnostics (very useful in production)
+with st.expander("Diagnostics", expanded=False):
+    st.write(f"Loaded columns: {len(px_all.columns)}")
+    st.write(f"Positions tickers used: {len(df2)}")
+    st.write(f"Return points (portfolio): {len(port_rets.dropna())}")
+    st.write("Missing tickers (requested but not in prices):", missing if missing else "None")
+    st.write("Sample price tail (EUR):")
+    st.dataframe(px_eur_ffill.tail(5), use_container_width=True)
 
 # Bench exposure summary
 st.subheader("Benchmark Exposure (daily)")
