@@ -1,26 +1,6 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Tanaka-Style Scorecard – CSV Upload (Ticker/Weight/Sleeve) + Auto Yahoo Finance
-#
-# CSV format (recommended):
-#   ticker,weight,sleeve
-#   NVDA,7.9,Platform
-#   CORT,13.2,Biotech/Pharma
-#
-# Minimal CSV:
-#   ticker,weight
-#   AAPL,10
-#   MSFT,15
-#
-# Install:
-#   pip install streamlit yfinance pandas numpy plotly
-#
-# requirements.txt (Streamlit Cloud):
-#   streamlit>=1.32
-#   pandas>=2.0
-#   numpy>=1.26
-#   yfinance>=0.2.36
-#   plotly>=5.18
+# Tanaka-Style Scorecard – Screenshot-Style Sidebar + Weights Editor + Auto Yahoo
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -32,7 +12,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG + CSS (Light KPI cards)
+# PAGE CONFIG + CSS
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Tanaka-Style Scorecard", page_icon="📈", layout="wide")
 
@@ -69,11 +49,10 @@ BASE_WEIGHTS = {
     "Other": {"growth": 0.16, "quality": 0.16, "valuation": 0.16, "momentum": 0.10, "convexity": 0.12, "risk": 0.14, "gap": 0.16},
 }
 
-DEFAULT_TICKERS = "CORT\nNUVB\nNVDA\nUAMY\nSYM\nAAPL\nNXE\nCPRX\nAMAT\nSF"
-DEFAULT_WEIGHTS = "13.2\n10.7\n7.9\n6.3\n6.0\n5.8\n5.4\n3.9\n3.1\n3.1"
+DEFAULT_TICKERS = ["LULU", "REI", "SRPT", "CAG", "NVO", "PYPL", "VIXL", "NVDA"]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITIES
+# UTIL
 # ─────────────────────────────────────────────────────────────────────────────
 def safe_float(x):
     try:
@@ -82,7 +61,7 @@ def safe_float(x):
         if isinstance(x, (int, float, np.integer, np.floating)):
             return float(x)
         if isinstance(x, str):
-            x = x.strip().replace(",", "")
+            x = x.strip().replace("%", "").replace(",", ".")
             if x == "" or x.lower() in {"none", "nan", "na", "n/a"}:
                 return np.nan
             return float(x)
@@ -91,10 +70,8 @@ def safe_float(x):
         return np.nan
 
 def z_to_01(x, xmin, xmax):
-    if np.isnan(x):
-        return np.nan
-    if xmax == xmin:
-        return 0.5
+    if np.isnan(x): return np.nan
+    if xmax == xmin: return 0.5
     return float(np.clip((x - xmin) / (xmax - xmin), 0.0, 1.0))
 
 def inv_to_01(x, xmin, xmax):
@@ -109,20 +86,14 @@ def clean_forward_pe(x):
     x = safe_float(x)
     return np.nan if (np.isnan(x) or x <= 0) else x
 
-def parse_tickers(text: str):
+def _parse_tickers_any(text: str):
     if not text:
         return []
-    raw = (
-        text.replace("\n", " ")
-            .replace("\t", " ")
-            .replace(";", ",")
-            .replace("|", ",")
-    )
+    raw = text.replace("\n", " ").replace("\t", " ").replace(";", ",").replace("|", ",")
     parts = []
     for chunk in raw.split(","):
         parts.extend(chunk.split())
     tickers = [p.strip().upper() for p in parts if p.strip()]
-    # dedupe keep order
     seen, out = set(), []
     for t in tickers:
         if t not in seen:
@@ -130,39 +101,41 @@ def parse_tickers(text: str):
             seen.add(t)
     return out
 
-def parse_weights(text: str, n: int):
-    if n <= 0:
-        return np.array([])
-    if not text or not text.strip():
-        return np.array([1.0 / n] * n)
+def _read_tickers_from_csv(uploaded_file) -> list[str]:
+    raw = uploaded_file.read()
+    text = raw.decode("utf-8", errors="ignore")
+    sep = ";" if text.count(";") > text.count(",") else ","
+    df = pd.read_csv(io.StringIO(text), sep=sep)
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    raw = text.replace("\n", " ").replace("\t", " ").replace(";", " ").replace(",", " ")
-    vals = [safe_float(x) for x in raw.split() if x.strip()]
-    vals = [v for v in vals if not np.isnan(v)]
-    if len(vals) == 0:
-        return np.array([1.0 / n] * n)
+    candidates = ["ticker", "symbol", "code", "codes", "ric"]
+    col = next((c for c in candidates if c in df.columns), None)
+    if col is None:
+        col = df.columns[0]
 
-    if len(vals) < n:
-        vals = vals + [vals[-1]] * (n - len(vals))
-    vals = np.array(vals[:n], dtype=float)
+    tickers = df[col].astype(str).str.upper().str.strip().tolist()
+    tickers = [t for t in tickers if t and t != "NAN"]
+    seen, out = set(), []
+    for t in tickers:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
 
-    s = float(np.sum(vals))
+def normalize_weights_pct(df):
+    w = df["weight"].apply(safe_float).fillna(0.0).values
+    s = float(np.sum(w))
     if s <= 0:
-        return np.array([1.0 / n] * n)
-
-    # if looks like percent
-    if 80 <= s <= 120:
-        vals = vals / 100.0
-    else:
-        vals = vals / s
-    return vals
+        df["weight"] = 0.0
+        return df
+    df["weight"] = (w / s) * 100.0
+    return df
 
 def sleeve_auto_heuristic(info: dict):
     sector = (info.get("sector") or "").lower()
     industry = (info.get("industry") or "").lower()
     name = (info.get("shortName") or info.get("longName") or "").lower()
     txt = " ".join([sector, industry, name])
-
     if any(k in txt for k in ["biotech", "biotechnology", "pharmaceutical", "pharma", "drug", "therapeutics"]):
         return "Biotech/Pharma"
     if any(k in txt for k in ["semiconductor", "software", "internet", "computer", "technology", "cloud", "hardware", "ai"]):
@@ -173,103 +146,8 @@ def sleeve_auto_heuristic(info: dict):
         return "Financials"
     return "Other"
 
-def read_portfolio_csv(uploaded_file) -> pd.DataFrame:
-    # robust CSV read: commas/semicolons, decimal commas
-    raw = uploaded_file.read()
-    text = raw.decode("utf-8", errors="ignore")
-    # guess separator
-    sep = ";" if text.count(";") > text.count(",") else ","
-    df = pd.read_csv(io.StringIO(text), sep=sep)
-
-    # normalize column names
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    if "ticker" not in df.columns:
-        # allow 'symbol'
-        if "symbol" in df.columns:
-            df = df.rename(columns={"symbol": "ticker"})
-        else:
-            raise ValueError("CSV braucht Spalte 'ticker' (alternativ 'symbol').")
-
-    if "weight" not in df.columns:
-        raise ValueError("CSV braucht Spalte 'weight' (Gewichtung).")
-
-    if "sleeve" not in df.columns:
-        df["sleeve"] = "Auto"
-
-    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    # decimal comma support for weight
-    df["weight"] = df["weight"].astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False).str.strip()
-    df["weight"] = df["weight"].apply(safe_float)
-    df["sleeve"] = df["sleeve"].astype(str).str.strip()
-    df.loc[~df["sleeve"].isin(SLEEVES), "sleeve"] = "Auto"
-
-    df = df[["ticker", "weight", "sleeve"]].copy()
-    df = df[df["ticker"].str.len() > 0].reset_index(drop=True)
-    return df
-
-def validate_and_fix_portfolio(df_in: pd.DataFrame, *,
-                               merge_duplicates: bool,
-                               normalize_to_100: bool) -> tuple[pd.DataFrame, list[str], list[str]]:
-    warnings, errors = [], []
-    df = df_in.copy()
-
-    # basic checks
-    if df.empty:
-        errors.append("Portfolio ist leer.")
-        return df, warnings, errors
-
-    if df["ticker"].isna().any() or (df["ticker"].astype(str).str.strip() == "").any():
-        errors.append("Es gibt leere Ticker-Zeilen.")
-        df = df[df["ticker"].astype(str).str.strip() != ""].copy()
-
-    if df["weight"].isna().any():
-        warnings.append("Einige Weights fehlen → werden mit 0 gesetzt.")
-        df["weight"] = df["weight"].fillna(0.0)
-
-    if (df["weight"] < 0).any():
-        errors.append("Negative Weights gefunden. Bitte korrigieren.")
-        return df, warnings, errors
-
-    # duplicates
-    dups = df["ticker"][df["ticker"].duplicated()].unique().tolist()
-    if len(dups) > 0:
-        if merge_duplicates:
-            warnings.append(f"Doppelte Ticker zusammengeführt: {', '.join(dups)}")
-            df = df.groupby("ticker", as_index=False).agg(
-                weight=("weight", "sum"),
-                sleeve=("sleeve", "first"),
-            )
-        else:
-            warnings.append(f"Doppelte Ticker gefunden (nicht zusammengeführt): {', '.join(dups)}")
-
-    # weight sum logic
-    wsum = float(df["weight"].sum())
-    if wsum <= 0:
-        errors.append("Summe der Weights ist 0. Bitte Weights setzen.")
-        return df, warnings, errors
-
-    # If likely decimals (0..1), convert to %
-    if wsum <= 1.5:  # heuristic
-        warnings.append("Weights sehen nach Dezimalgewichten aus (0–1). Konvertiere zu %.")
-        df["weight"] = df["weight"] * 100.0
-        wsum = float(df["weight"].sum())
-
-    if normalize_to_100:
-        df["weight"] = df["weight"] / wsum * 100.0
-        warnings.append("Weights auf 100% normalisiert.")
-    else:
-        if not (99.0 <= wsum <= 101.0):
-            warnings.append(f"Summe der Weights = {wsum:.2f}% (nicht 100%).")
-
-    # sleeve defaults
-    df.loc[df["sleeve"].isna() | (df["sleeve"].astype(str).str.strip() == ""), "sleeve"] = "Auto"
-    df.loc[~df["sleeve"].isin(SLEEVES), "sleeve"] = "Auto"
-
-    return df, warnings, errors
-
 # ─────────────────────────────────────────────────────────────────────────────
-# YAHOO FINANCE FETCH
+# YF fetch (cached)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info(ticker: str):
@@ -330,14 +208,12 @@ def cash_runway_months(bs: pd.DataFrame, cf: pd.DataFrame):
         if isinstance(bs, pd.DataFrame) and not bs.empty:
             for cand in ["Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash"]:
                 if cand in bs.index:
-                    cash = safe_float(bs.loc[cand].iloc[0])
-                    break
+                    cash = safe_float(bs.loc[cand].iloc[0]); break
         ocf = np.nan
         if isinstance(cf, pd.DataFrame) and not cf.empty:
             for cand in ["Total Cash From Operating Activities", "Operating Cash Flow", "OperatingCashFlow"]:
                 if cand in cf.index:
-                    ocf = safe_float(cf.loc[cand].iloc[0])
-                    break
+                    ocf = safe_float(cf.loc[cand].iloc[0]); break
         if not np.isnan(cash) and not np.isnan(ocf) and ocf < 0:
             return (cash / abs(ocf)) * 12.0
     except Exception:
@@ -351,8 +227,7 @@ def try_cagr_from_income_stmt(inc: pd.DataFrame, row_name_candidates, years=4):
         row = None
         for cand in row_name_candidates:
             if cand in inc.index:
-                row = cand
-                break
+                row = cand; break
         if row is None:
             return np.nan
         s = inc.loc[row].dropna().astype(float)
@@ -371,28 +246,24 @@ def try_cagr_from_income_stmt(inc: pd.DataFrame, row_name_candidates, years=4):
 # SCORING
 # ─────────────────────────────────────────────────────────────────────────────
 def score_growth(vals):
-    eps = vals.get("eps_cagr_3y", np.nan)
-    rev = vals.get("rev_cagr_3y", np.nan)
-    s = nanmean([z_to_01(eps, -0.20, 0.40), z_to_01(rev, -0.10, 0.30)])
+    s = nanmean([z_to_01(vals.get("eps_cagr_3y", np.nan), -0.20, 0.40),
+                 z_to_01(vals.get("rev_cagr_3y", np.nan), -0.10, 0.30)])
     return np.nan if np.isnan(s) else float(np.clip(s * 100, 0, 100))
 
 def score_quality(vals):
-    roe = vals.get("roe", np.nan)
-    opm = vals.get("oper_margin", np.nan)
-    s = nanmean([z_to_01(roe, -0.10, 0.30), z_to_01(opm, -0.10, 0.35)])
+    s = nanmean([z_to_01(vals.get("roe", np.nan), -0.10, 0.30),
+                 z_to_01(vals.get("oper_margin", np.nan), -0.10, 0.35)])
     return np.nan if np.isnan(s) else float(np.clip(s * 100, 0, 100))
 
 def score_valuation(vals):
-    fpe = vals.get("forward_pe", np.nan)
-    tpe = vals.get("trailing_pe", np.nan)
-    peg = vals.get("peg", np.nan)
-    fcfy = vals.get("fcf_yield", np.nan)
-    s = nanmean([inv_to_01(fpe, 5, 60), inv_to_01(tpe, 5, 60), inv_to_01(peg, 0.5, 3.0), z_to_01(fcfy, -0.02, 0.08)])
+    s = nanmean([inv_to_01(vals.get("forward_pe", np.nan), 5, 60),
+                 inv_to_01(vals.get("trailing_pe", np.nan), 5, 60),
+                 inv_to_01(vals.get("peg", np.nan), 0.5, 3.0),
+                 z_to_01(vals.get("fcf_yield", np.nan), -0.02, 0.08)])
     return np.nan if np.isnan(s) else float(np.clip(s * 100, 0, 100))
 
 def score_momentum(vals):
-    mom = vals.get("mom_6m", np.nan)
-    s = z_to_01(mom, -0.40, 0.60)
+    s = z_to_01(vals.get("mom_6m", np.nan), -0.40, 0.60)
     return np.nan if np.isnan(s) else float(np.clip(s * 100, 0, 100))
 
 def score_convexity(vals, sleeve):
@@ -401,7 +272,7 @@ def score_convexity(vals, sleeve):
     s_vol = z_to_01(vol, 0.15, 0.90)
     s_size = np.nan
     if not np.isnan(mcap) and mcap > 0:
-        s_size = inv_to_01(np.log10(mcap), 9.0, 12.0)  # 1B..1T
+        s_size = inv_to_01(np.log10(mcap), 9.0, 12.0)
     base = {"Platform": 0.35, "Biotech/Pharma": 0.70, "Minerals/Energy": 0.70, "Financials": 0.25, "Other": 0.45}.get(sleeve, 0.45)
     s = nanmean([s_vol, s_size, base])
     return np.nan if np.isnan(s) else float(np.clip(s * 100, 0, 100))
@@ -419,8 +290,7 @@ def score_risk(vals, sleeve):
     runway_score = z_to_01(runway, 0.0, 36.0)
 
     s = nanmean([vol_score, nde_score, runway_score])
-    if np.isnan(s):
-        return np.nan
+    if np.isnan(s): return np.nan
     risk = float(np.clip(s * 100, 0, 100))
     if not np.isnan(runway) and runway < 6:
         risk = min(risk, 35.0)
@@ -430,12 +300,10 @@ def score_expectation_gap(vals):
     eps = vals.get("eps_cagr_3y", np.nan)
     rev = vals.get("rev_cagr_3y", np.nan)
     mom = vals.get("mom_6m", np.nan)
-
     expected = nanmean([eps, rev])
     fpe = vals.get("forward_pe", np.nan)
     implied = (1.0 / fpe) if (not np.isnan(fpe) and fpe > 0) else 0.0
     mom_tilt = 0.25 * mom if not np.isnan(mom) else 0.0
-
     gap = (expected if not np.isnan(expected) else 0.0) - implied + mom_tilt
     s = z_to_01(gap, -0.10, 0.30)
     return float(np.clip(s * 100, 0, 100)), expected, implied, gap
@@ -468,29 +336,23 @@ def compute_total_score(row: pd.Series):
         "convexity": score_convexity(vals, sleeve),
         "risk": score_risk(vals, sleeve),
     }
-
     gap_score, exp_g, impl_g, gap_raw = score_expectation_gap(vals)
     subs["gap"] = gap_score
 
-    # sleeve adjustment
     if sleeve in ["Biotech/Pharma", "Minerals/Energy"]:
         weights["risk"] *= 0.60
         weights["convexity"] *= 1.15
         ssum = sum(weights.values())
         weights = {k: v / ssum for k, v in weights.items()}
 
-    avail = {k: v for k, v in subs.items() if not np.isnan(v)}
-    if not avail:
-        return np.nan, subs, exp_g, impl_g, gap_raw
-
     wsum, wtot = 0.0, 0.0
     for k, v in subs.items():
-        if np.isnan(v):
-            continue
+        if np.isnan(v): continue
         wsum += weights.get(k, 0.0) * v
         wtot += weights.get(k, 0.0)
+    if wtot <= 0: return np.nan, subs, exp_g, impl_g, gap_raw
 
-    total = wsum / (wtot if wtot > 0 else 1.0)
+    total = wsum / wtot
     return float(np.clip(total, 0, 100)), subs, exp_g, impl_g, gap_raw
 
 def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
@@ -536,87 +398,135 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     return row
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR: CSV Upload + Controls
+# SIDEBAR – exakt wie Screenshot-Flow
 # ─────────────────────────────────────────────────────────────────────────────
-st.sidebar.title("Portfolio Input")
+st.sidebar.header("CSV-Dateien")
 
-uploaded = st.sidebar.file_uploader("Upload CSV (ticker, weight, optional sleeve)", type=["csv"])
-merge_duplicates = st.sidebar.toggle("Merge duplicate tickers", value=True)
-normalize_to_100 = st.sidebar.toggle("Normalize weights to 100%", value=True)
-auto_fetch = st.sidebar.toggle("Auto-fetch Yahoo Finance", value=True)
-default_sleeve = st.sidebar.selectbox("Default sleeve (fallback)", SLEEVES, index=0)
-refresh = st.sidebar.button("Load / Refresh")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    '<div class="small-note">CSV: columns <b>ticker</b>, <b>weight</b>, optional <b>sleeve</b> (Auto/Platform/Biotech/...).</div>',
-    unsafe_allow_html=True,
+uploaded = st.sidebar.file_uploader(
+    "Drag and drop files here",
+    type=["csv"],
+    accept_multiple_files=False
 )
 
-# Fallback manual input
-with st.sidebar.expander("Manual input (fallback)", expanded=False):
-    tickers_text = st.text_area("Tickers", value=DEFAULT_TICKERS, height=130)
-    weights_text = st.text_area("Weights", value=DEFAULT_WEIGHTS, height=130)
+manual = st.sidebar.text_input("Weitere Ticker manuell hinzufügen (Komma-getrennt)", value="")
+
+st.sidebar.caption("")  # spacing
+shuffle = st.sidebar.checkbox("Zufällig mischen", value=False)
+max_n = st.sidebar.number_input("Max. Anzahl (0 = alle)", min_value=0, value=0, step=1)
+
+# Combine tickers
+tickers = []
+if uploaded is not None:
+    try:
+        tickers.extend(_read_tickers_from_csv(uploaded))
+    except Exception as e:
+        st.sidebar.error(f"CSV konnte nicht gelesen werden: {e}")
+
+tickers.extend(_parse_tickers_any(manual))
+
+# If none provided, use defaults (nice UX)
+if len(tickers) == 0:
+    tickers = DEFAULT_TICKERS.copy()
+
+# dedupe keep order
+seen, combined = set(), []
+for t in tickers:
+    if t not in seen:
+        combined.append(t)
+        seen.add(t)
+
+if shuffle and len(combined) > 1:
+    rng = np.random.default_rng(42)
+    combined = list(rng.permutation(combined))
+
+if max_n and max_n > 0:
+    combined = combined[: int(max_n)]
+
+st.sidebar.caption(f"Gefundene Ticker: {len(combined)}")
+
+selected = st.sidebar.multiselect(
+    "Auswahl verfeinern",
+    options=combined,
+    default=combined
+)
+
+df_out = pd.DataFrame({"ticker": selected})
+st.sidebar.download_button(
+    "Kombinierte Ticker als CSV",
+    data=df_out.to_csv(index=False).encode("utf-8"),
+    file_name="combined_tickers.csv",
+    mime="text/csv"
+)
+
+st.sidebar.markdown("---")
+default_sleeve = st.sidebar.selectbox("Default Sleeve", SLEEVES, index=0)
+auto_normalize = st.sidebar.toggle("Weights automatisch auf 100% normalisieren", value=True)
+auto_fetch = st.sidebar.toggle("Yahoo Finance automatisch laden", value=True)
+run = st.sidebar.button("Load / Refresh", type="primary")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BUILD INPUT DF
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-def build_input_df():
-    if uploaded is not None:
-        df0 = read_portfolio_csv(uploaded)
-        # fill sleeve if missing
-        df0["sleeve"] = df0["sleeve"].fillna("Auto")
-        return df0
+st.title("📈 Tanaka-Style Scorecard")
+st.caption("Workflow: Ticker rein → Gewicht setzen → Auto Yahoo Pull → Score + Charts + Action Panel.")
 
-    # fallback from textareas
-    tickers = parse_tickers(tickers_text)
-    if len(tickers) == 0:
-        return pd.DataFrame(columns=["ticker", "weight", "sleeve"])
-    w_dec = parse_weights(weights_text, len(tickers))  # decimals
-    df0 = pd.DataFrame({"ticker": tickers, "weight": w_dec * 100.0, "sleeve": [default_sleeve] * len(tickers)})
-    return df0
-
-df_raw = build_input_df()
-df_port, warns, errs = validate_and_fix_portfolio(df_raw, merge_duplicates=merge_duplicates, normalize_to_100=normalize_to_100)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────────────────────────────────────
-st.title("📈 Tanaka-Style Scorecard (CSV Upload + Auto Yahoo Finance)")
-st.caption("Du pflegst nur Ticker & Gewichtung (CSV oder manuell). Der Rest wird automatisch gezogen und gescored.")
-
-if errs:
-    for e in errs:
-        st.error(e)
+if len(selected) == 0:
+    st.warning("Keine Ticker selektiert.")
     st.stop()
 
-if warns:
-    for w in warns:
-        st.warning(w)
+# Initialize weights table session state (stable across reruns)
+if "weights_df" not in st.session_state:
+    eq_w = 100.0 / len(selected)
+    st.session_state["weights_df"] = pd.DataFrame(
+        {"ticker": selected, "weight": [eq_w] * len(selected), "sleeve": [default_sleeve] * len(selected)}
+    )
 
-st.subheader("1) Portfolio Setup (editable)")
+# Sync tickers with selection (keep existing weights if possible)
+old = st.session_state["weights_df"].copy()
+old_map_w = dict(zip(old["ticker"], old["weight"]))
+old_map_s = dict(zip(old["ticker"], old["sleeve"]))
+
+new_rows = []
+for t in selected:
+    new_rows.append(
+        {
+            "ticker": t,
+            "weight": float(old_map_w.get(t, 100.0 / len(selected))),
+            "sleeve": old_map_s.get(t, default_sleeve),
+        }
+    )
+st.session_state["weights_df"] = pd.DataFrame(new_rows)
+
+st.subheader("1) Weights (nur Ticker + Gewicht)")
 edited = st.data_editor(
-    df_port,
+    st.session_state["weights_df"],
     use_container_width=True,
-    num_rows="dynamic",
+    num_rows="fixed",
+    hide_index=True,
     column_config={
-        "ticker": st.column_config.TextColumn("Ticker", width="small"),
+        "ticker": st.column_config.TextColumn("Ticker", disabled=True, width="small"),
         "weight": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, step=0.1, format="%.2f"),
         "sleeve": st.column_config.SelectboxColumn("Sleeve", options=SLEEVES, width="medium"),
     },
-    hide_index=True,
-    key="portfolio_editor",
 )
 
-# Apply same validation after edit
-df_port2, warns2, errs2 = validate_and_fix_portfolio(edited, merge_duplicates=merge_duplicates, normalize_to_100=normalize_to_100)
-if errs2:
-    for e in errs2:
-        st.error(e)
+# Apply normalize and store back
+df_in = edited.copy()
+df_in["weight"] = df_in["weight"].apply(safe_float).fillna(0.0)
+df_in["sleeve"] = df_in["sleeve"].astype(str).str.strip()
+df_in.loc[~df_in["sleeve"].isin(SLEEVES), "sleeve"] = "Auto"
+df_in = df_in[df_in["ticker"].astype(str).str.strip() != ""].reset_index(drop=True)
+
+if auto_normalize:
+    df_in = normalize_weights_pct(df_in)
+
+st.session_state["weights_df"] = df_in
+
+# Run button: not strictly necessary (streamlit reruns anyway), but PM-feel
+if not run and "ran_once" not in st.session_state:
+    st.info("Stell die Weights ein und klicke links auf **Load / Refresh**.")
     st.stop()
-if warns2:
-    for w in warns2:
-        st.info(w)
+st.session_state["ran_once"] = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FETCH + SCORE
@@ -625,22 +535,17 @@ st.markdown("---")
 st.subheader("2) KPIs & Tanaka Score")
 
 rows = []
-with st.spinner("Pulling Yahoo Finance data & computing scores …"):
-    for _, r in df_port2.iterrows():
-        tkr = str(r["ticker"]).upper().strip()
+with st.spinner("Pulling Yahoo Finance fundamentals & computing scores …"):
+    for _, r in df_in.iterrows():
+        tkr = r["ticker"]
         wt = float(safe_float(r["weight"]))
-        sl = str(r.get("sleeve", "Auto")).strip()
-        if sl not in SLEEVES:
-            sl = "Auto"
-        if auto_fetch:
-            rows.append(build_row(tkr, sl, wt))
-        else:
+        sl = r.get("sleeve", "Auto")
+        if not auto_fetch:
             rows.append({"ticker": tkr, "weight": wt, "sleeve": sl})
+        else:
+            rows.append(build_row(tkr, sl, wt))
 
 df = pd.DataFrame(rows)
-if df.empty:
-    st.stop()
-
 df["weight_dec"] = df["weight"].apply(safe_float) / 100.0
 port_score = float(np.nansum(df["tanaka_score"] * df["weight_dec"])) if df["tanaka_score"].notna().any() else np.nan
 
@@ -667,7 +572,7 @@ st.dataframe(df[show_cols].sort_values("weight", ascending=False), use_container
 st.download_button("Download KPI Table (CSV)", df[show_cols].to_csv(index=False).encode("utf-8"), "tanaka_scorecard.csv", "text/csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHARTS (Plotly)
+# CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("3) Charts")
@@ -685,10 +590,7 @@ with c2:
     d["wtd_contrib"] = d["tanaka_score"] * d["weight_dec"]
     d = d.sort_values("wtd_contrib", ascending=False)
     fig = px.bar(
-        d,
-        x="wtd_contrib",
-        y="ticker",
-        orientation="h",
+        d, x="wtd_contrib", y="ticker", orientation="h",
         title="Weighted Score Contribution (Score × Weight)",
         hover_data=["name", "sleeve", "tanaka_score", "weight"],
     )
@@ -696,18 +598,13 @@ with c2:
     st.plotly_chart(fig, use_container_width=True)
 
 c3, c4 = st.columns([1.25, 0.75], gap="large")
-
 with c3:
     g = df["eps_cagr_3y"].where(df["eps_cagr_3y"].notna(), df["rev_cagr_3y"])
     scatter = df.copy()
     scatter["growth_proxy"] = g
     fig = px.scatter(
-        scatter,
-        x="forward_pe",
-        y="growth_proxy",
-        size="weight",
-        color="sleeve",
-        hover_name="ticker",
+        scatter, x="forward_pe", y="growth_proxy",
+        size="weight", color="sleeve", hover_name="ticker",
         hover_data={"name": True, "tanaka_score": True, "weight": True, "forward_pe": True, "growth_proxy": True},
         title="Valuation vs Growth (proxy) — 'Undervalued Growth' Map",
     )
@@ -730,7 +627,6 @@ with c4:
     ]
     cats2 = cats + [cats[0]]
     vals2 = vals + [vals[0]]
-
     fig = go.Figure()
     fig.add_trace(go.Scatterpolar(r=vals2, theta=cats2, fill="toself", name=pick))
     fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
@@ -740,12 +636,8 @@ st.markdown("---")
 st.subheader("4) Expectation-Gap Overlay")
 
 fig = px.scatter(
-    df,
-    x="implied_growth",
-    y="expected_growth",
-    size="weight",
-    color="sleeve",
-    hover_name="ticker",
+    df, x="implied_growth", y="expected_growth",
+    size="weight", color="sleeve", hover_name="ticker",
     hover_data={"name": True, "tanaka_score": True, "expectation_gap": True},
     title="Expected vs Implied Growth (Tanaka Expectation-Gap Overlay)",
 )
@@ -801,11 +693,9 @@ for _, r in df.iterrows():
 
     flags.append(", ".join(flag) if flag else "—")
 
-df_flags = df[[
-    "ticker","name","sleeve","weight","tanaka_score",
-    "forward_pe","peg","vol_1y","cash_runway_months","net_debt_to_ebitda",
-    "expected_growth","implied_growth","expectation_gap"
-]].copy()
+df_flags = df[
+    ["ticker","name","sleeve","weight","tanaka_score","forward_pe","peg","vol_1y","cash_runway_months","net_debt_to_ebitda","expected_growth","implied_growth","expectation_gap"]
+].copy()
 df_flags["flags"] = flags
 
 st.dataframe(df_flags.sort_values("tanaka_score", ascending=False), use_container_width=True, hide_index=True)
