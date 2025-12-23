@@ -550,6 +550,59 @@ def compute_beta_corr(asset_ret: pd.Series, bench_ret: pd.Series) -> tuple[float
     corr = np.corrcoef(a, b)[0, 1]
     return float(beta), float(corr)
 
+
+def compute_regression_metrics(asset_ret: pd.Series, bench_ret: pd.Series, periods_per_year: int = 252):
+    """
+    Regression: asset = alpha + beta * bench + eps
+    Returns: beta, corr, r2, alpha_daily, alpha_annual
+    """
+    df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
+    if df2.shape[0] < 60:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    a = df2.iloc[:, 0].values
+    b = df2.iloc[:, 1].values
+
+    var_b = np.var(b, ddof=1)
+    if var_b <= 0:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    cov_ab = np.cov(a, b, ddof=1)[0, 1]
+    beta = cov_ab / var_b
+
+    # alpha = E[a] - beta * E[b]
+    alpha_daily = float(np.mean(a) - beta * np.mean(b))
+
+    # corr + r2
+    corr = float(np.corrcoef(a, b)[0, 1])
+    r2 = float(corr ** 2) if not np.isnan(corr) else np.nan
+
+    # annualize alpha (approx)
+    alpha_annual = float((1.0 + alpha_daily) ** periods_per_year - 1.0)
+
+    return float(beta), corr, r2, alpha_daily, alpha_annual
+
+
+def tracking_error_and_ir(asset_ret: pd.Series, bench_ret: pd.Series, periods_per_year: int = 252):
+    """
+    Active return = asset - bench
+    Tracking Error = std(active) * sqrt(annual)
+    IR = mean(active)*annual / TE
+    """
+    df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
+    if df2.shape[0] < 60:
+        return np.nan, np.nan, np.nan
+
+    active = df2.iloc[:, 0] - df2.iloc[:, 1]
+    te = float(np.std(active, ddof=1) * np.sqrt(periods_per_year))
+    ar = float(np.mean(active) * periods_per_year)
+    ir = float(ar / te) if te > 0 else np.nan
+    return te, ar, ir
+
+
+
+
+
 def portfolio_returns_from_prices(px: pd.DataFrame, weights_pct: pd.Series) -> pd.Series:
     rets = px.pct_change().dropna(how="all")
     common = [c for c in rets.columns if c in weights_pct.index]
@@ -847,14 +900,31 @@ else:
     if tmp.shape[0] < 60:
         st.warning("Zu wenig überlappende Datenpunkte für saubere Schätzung.")
     else:
-        port_beta_sp, port_corr_sp = compute_beta_corr(tmp["PORT"], tmp["SPX"])
-        port_beta_dax, port_corr_dax = compute_beta_corr(tmp["PORT"], tmp["DAX"])
+        port_beta_sp, port_corr_sp, port_r2_sp, port_alpha_d_sp, port_alpha_a_sp = compute_regression_metrics(tmp["PORT"], tmp["SPX"])
+        port_beta_dax, port_corr_dax, port_r2_dax, port_alpha_d_dax, port_alpha_a_dax = compute_regression_metrics(tmp["PORT"], tmp["DAX"])
+        
+        te_sp, ar_sp, ir_sp = tracking_error_and_ir(tmp["PORT"], tmp["SPX"])
+        te_dx, ar_dx, ir_dx = tracking_error_and_ir(tmp["PORT"], tmp["DAX"])
+
 
         m1, m2, m3, m4 = st.columns(4, gap="large")
-        m1.metric("Portfolio Beta vs S&P 500", f"{port_beta_sp:.2f}" if not np.isnan(port_beta_sp) else "—")
-        m2.metric("Portfolio Corr vs S&P 500", f"{port_corr_sp:.2f}" if not np.isnan(port_corr_sp) else "—")
-        m3.metric("Portfolio Beta vs DAX", f"{port_beta_dax:.2f}" if not np.isnan(port_beta_dax) else "—")
-        m4.metric("Portfolio Corr vs DAX", f"{port_corr_dax:.2f}" if not np.isnan(port_corr_dax) else "—")
+        m1.metric("Beta vs S&P 500", f"{port_beta_sp:.2f}" if not np.isnan(port_beta_sp) else "—")
+        m2.metric("Corr vs S&P 500", f"{port_corr_sp:.2f}" if not np.isnan(port_corr_sp) else "—")
+        m3.metric("R² vs S&P 500", f"{port_r2_sp:.2f}" if not np.isnan(port_r2_sp) else "—")
+        m4.metric("Alpha p.a. vs S&P 500", f"{port_alpha_a_sp*100:.1f}%" if not np.isnan(port_alpha_a_sp) else "—")
+        
+        m5, m6, m7, m8 = st.columns(4, gap="large")
+        m5.metric("Beta vs DAX", f"{port_beta_dax:.2f}" if not np.isnan(port_beta_dax) else "—")
+        m6.metric("Corr vs DAX", f"{port_corr_dax:.2f}" if not np.isnan(port_corr_dax) else "—")
+        m7.metric("R² vs DAX", f"{port_r2_dax:.2f}" if not np.isnan(port_r2_dax) else "—")
+        m8.metric("Alpha p.a. vs DAX", f"{port_alpha_a_dax*100:.1f}%" if not np.isnan(port_alpha_a_dax) else "—")
+
+        t1, t2, t3, t4 = st.columns(4, gap="large")
+        t1.metric("Tracking Error p.a. vs S&P 500", f"{te_sp*100:.1f}%" if not np.isnan(te_sp) else "—")
+        t2.metric("Active Return p.a. vs S&P 500", f"{ar_sp*100:.1f}%" if not np.isnan(ar_sp) else "—")
+        t3.metric("Info Ratio vs S&P 500", f"{ir_sp:.2f}" if not np.isnan(ir_sp) else "—")
+        t4.metric(" ", " ")  # Spacer
+
 
         rows_b = []
         for t in tickers_list:
@@ -874,6 +944,10 @@ else:
                 "corr_spx": corr_sp,
                 "beta_dax": beta_dx,
                 "corr_dax": corr_dx,
+                "r2_spx": r2_sp,
+                "alpha_pa_spx": a_a_sp,
+                "r2_dax": r2_dx,
+                "alpha_pa_dax": a_a_dx,
             })
 
         df_b = pd.DataFrame(rows_b).sort_values("weight_%", ascending=False)
