@@ -201,6 +201,117 @@ def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].apply(safe_float)
     return df
 
+
+def rolling_beta_alpha(asset_ret: pd.Series, bench_ret: pd.Series, window: int = 60, periods_per_year: int = 252):
+    """
+    Rolling Regression asset = alpha + beta * bench
+    Returns DataFrame with columns: beta, alpha_daily, alpha_annual, r2, corr
+    """
+    df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
+    if df2.shape[0] < window + 5:
+        return pd.DataFrame()
+
+    a = df2.iloc[:, 0]
+    b = df2.iloc[:, 1]
+
+    cov_ab = a.rolling(window).cov(b)
+    var_b = b.rolling(window).var()
+    beta = cov_ab / var_b
+
+    mean_a = a.rolling(window).mean()
+    mean_b = b.rolling(window).mean()
+    alpha_daily = mean_a - beta * mean_b
+
+    corr = a.rolling(window).corr(b)
+    r2 = corr ** 2
+
+    alpha_annual = (1.0 + alpha_daily) ** periods_per_year - 1.0
+
+    out = pd.DataFrame({
+        "beta": beta,
+        "alpha_daily": alpha_daily,
+        "alpha_annual": alpha_annual,
+        "r2": r2,
+        "corr": corr
+    }).dropna(how="all")
+    return out
+
+
+def alpha_drawdown_regimes(alpha_pa: pd.Series,
+                           dd_threshold: float = -0.10,
+                           alpha_threshold: float = -0.05,
+                           min_len: int = 10):
+    """
+    Detect alpha drawdown regimes on rolling alpha p.a. series (decimal).
+    dd = alpha - cummax(alpha). Regime if dd <= dd_threshold OR alpha <= alpha_threshold.
+    Returns list of (start_ts, end_ts, label)
+    """
+    s = alpha_pa.dropna().copy()
+    if s.empty:
+        return []
+
+    peak = s.cummax()
+    dd = s - peak
+
+    in_regime = (dd <= dd_threshold) | (s <= alpha_threshold)
+
+    idx = s.index
+    regimes = []
+    start = None
+
+    for i in range(len(in_regime)):
+        if in_regime.iloc[i] and start is None:
+            start = idx[i]
+        if (not in_regime.iloc[i]) and start is not None:
+            end = idx[i - 1]
+            length = (idx.get_loc(end) - idx.get_loc(start) + 1)
+            if length >= int(min_len):
+                regimes.append((start, end, "Alpha DD Regime"))
+            start = None
+
+    if start is not None:
+        end = idx[-1]
+        length = (idx.get_loc(end) - idx.get_loc(start) + 1)
+        if length >= int(min_len):
+            regimes.append((start, end, "Alpha DD Regime"))
+
+    return regimes
+
+
+def add_regime_bands(fig: go.Figure, regimes, fillcolor="rgba(220,38,38,0.12)"):
+    """Add shaded vertical bands for regimes."""
+    for (s, e, _) in regimes:
+        fig.add_vrect(
+            x0=s, x1=e,
+            fillcolor=fillcolor,
+            opacity=1.0,
+            layer="below",
+            line_width=0
+        )
+    return fig
+
+
+def regimes_summary(alpha_pa: pd.Series, regimes):
+    rows = []
+    for s, e, _ in regimes:
+        seg = alpha_pa.loc[s:e].dropna()
+        if seg.empty:
+            continue
+        rows.append({
+            "start": s.date(),
+            "end": e.date(),
+            "days": len(seg),
+            "min_alpha_pa": float(seg.min()),
+            "avg_alpha_pa": float(seg.mean()),
+        })
+    return pd.DataFrame(rows)
+
+
+
+
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FLAGS – Variante A: Klassifikation + HTML Badges
 # ─────────────────────────────────────────────────────────────────────────────
@@ -985,6 +1096,99 @@ else:
             yaxis=dict(range=[-1, 1]),
         )
         st.plotly_chart(fig, use_container_width=True)
+
+
+st.markdown("### Rolling Alpha & Beta (Portfolio vs Benchmarks)")
+
+# --- Controls
+w1, w2, w3, w4 = st.columns([1, 1, 1, 1], gap="large")
+with w1:
+    win1 = st.selectbox("Rolling Window 1", [30, 60, 90, 126], index=1, key="roll_win1")
+with w2:
+    win2 = st.selectbox("Rolling Window 2", [60, 90, 126, 252], index=2, key="roll_win2")
+with w3:
+    dd_thr = st.slider("Alpha DD Threshold (p.a.)", -0.50, 0.0, -0.10, 0.01, key="dd_thr")
+with w4:
+    a_thr = st.slider("Alpha Level Threshold (p.a.)", -0.50, 0.0, -0.05, 0.01, key="a_thr")
+
+min_len = st.number_input("Min Regime Length (days)", min_value=3, value=10, step=1, key="min_len")
+
+# --- Rolling series
+roll_sp_1 = rolling_beta_alpha(tmp["PORT"], tmp["SPX"], window=int(win1))
+roll_sp_2 = rolling_beta_alpha(tmp["PORT"], tmp["SPX"], window=int(win2))
+roll_dx_1 = rolling_beta_alpha(tmp["PORT"], tmp["DAX"], window=int(win1))
+roll_dx_2 = rolling_beta_alpha(tmp["PORT"], tmp["DAX"], window=int(win2))
+
+c1, c2 = st.columns(2, gap="large")
+
+# --- SPX chart
+with c1:
+    fig = go.Figure()
+
+    if not roll_sp_1.empty:
+        fig.add_trace(go.Scatter(x=roll_sp_1.index, y=roll_sp_1["beta"], name=f"Beta vs SPX ({win1}D)"))
+        fig.add_trace(go.Scatter(x=roll_sp_1.index, y=roll_sp_1["alpha_annual"]*100, name=f"Alpha p.a. vs SPX ({win1}D)", yaxis="y2"))
+        regimes_sp = alpha_drawdown_regimes(roll_sp_1["alpha_annual"], dd_threshold=float(dd_thr), alpha_threshold=float(a_thr), min_len=int(min_len))
+        fig = add_regime_bands(fig, regimes_sp, fillcolor="rgba(220,38,38,0.12)")
+
+    if not roll_sp_2.empty:
+        fig.add_trace(go.Scatter(x=roll_sp_2.index, y=roll_sp_2["beta"], name=f"Beta vs SPX ({win2}D)", line=dict(dash="dot")))
+        fig.add_trace(go.Scatter(x=roll_sp_2.index, y=roll_sp_2["alpha_annual"]*100, name=f"Alpha p.a. vs SPX ({win2}D)", yaxis="y2", line=dict(dash="dot")))
+
+    fig.update_layout(
+        title="Rolling Beta (left) & Rolling Alpha p.a. (right) — vs S&P 500",
+        margin=dict(l=10, r=10, t=50, b=10),
+        yaxis=dict(title="Beta"),
+        yaxis2=dict(title="Alpha p.a. (%)", overlaying="y", side="right"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# --- DAX chart
+with c2:
+    fig = go.Figure()
+
+    if not roll_dx_1.empty:
+        fig.add_trace(go.Scatter(x=roll_dx_1.index, y=roll_dx_1["beta"], name=f"Beta vs DAX ({win1}D)"))
+        fig.add_trace(go.Scatter(x=roll_dx_1.index, y=roll_dx_1["alpha_annual"]*100, name=f"Alpha p.a. vs DAX ({win1}D)", yaxis="y2"))
+        regimes_dx = alpha_drawdown_regimes(roll_dx_1["alpha_annual"], dd_threshold=float(dd_thr), alpha_threshold=float(a_thr), min_len=int(min_len))
+        fig = add_regime_bands(fig, regimes_dx, fillcolor="rgba(220,38,38,0.12)")
+
+    if not roll_dx_2.empty:
+        fig.add_trace(go.Scatter(x=roll_dx_2.index, y=roll_dx_2["beta"], name=f"Beta vs DAX ({win2}D)", line=dict(dash="dot")))
+        fig.add_trace(go.Scatter(x=roll_dx_2.index, y=roll_dx_2["alpha_annual"]*100, name=f"Alpha p.a. vs DAX ({win2}D)", yaxis="y2", line=dict(dash="dot")))
+
+    fig.update_layout(
+        title="Rolling Beta (left) & Rolling Alpha p.a. (right) — vs DAX",
+        margin=dict(l=10, r=10, t=50, b=10),
+        yaxis=dict(title="Beta"),
+        yaxis2=dict(title="Alpha p.a. (%)", overlaying="y", side="right"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# --- Summary tables (optional but useful)
+if not roll_sp_1.empty:
+    regimes_sp = alpha_drawdown_regimes(roll_sp_1["alpha_annual"], dd_threshold=float(dd_thr), alpha_threshold=float(a_thr), min_len=int(min_len))
+    df_reg_sp = regimes_summary(roll_sp_1["alpha_annual"], regimes_sp)
+    if not df_reg_sp.empty:
+        df_reg_sp["min_alpha_pa"] = (df_reg_sp["min_alpha_pa"] * 100).round(1).astype(str) + "%"
+        df_reg_sp["avg_alpha_pa"] = (df_reg_sp["avg_alpha_pa"] * 100).round(1).astype(str) + "%"
+        st.markdown("#### Alpha Drawdown Regimes vs S&P 500")
+        st.dataframe(df_reg_sp, use_container_width=True, hide_index=True)
+
+if not roll_dx_1.empty:
+    regimes_dx = alpha_drawdown_regimes(roll_dx_1["alpha_annual"], dd_threshold=float(dd_thr), alpha_threshold=float(a_thr), min_len=int(min_len))
+    df_reg_dx = regimes_summary(roll_dx_1["alpha_annual"], regimes_dx)
+    if not df_reg_dx.empty:
+        df_reg_dx["min_alpha_pa"] = (df_reg_dx["min_alpha_pa"] * 100).round(1).astype(str) + "%"
+        df_reg_dx["avg_alpha_pa"] = (df_reg_dx["avg_alpha_pa"] * 100).round(1).astype(str) + "%"
+        st.markdown("#### Alpha Drawdown Regimes vs DAX")
+        st.dataframe(df_reg_dx, use_container_width=True, hide_index=True)
+
+
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ACTION PANEL – HTML Badges (Grün/Rot/Gelb)
