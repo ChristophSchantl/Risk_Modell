@@ -2,6 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Tanaka-Style Scorecard – Screenshot-Style Sidebar + Weights + Yahoo + Charts
 # + Beta/Correlation vs S&P 500 & DAX
+# + Rolling Alpha/Beta (nur Linien, keine Flächen)
 # + Action Panel mit farbigen Badges (HTML)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -76,17 +77,16 @@ BASE_WEIGHTS = {
 
 DEFAULT_TICKERS = ["LULU", "REI", "SRPT", "CAG", "NVO", "PYPL", "VIXL", "NVDA"]
 
+# Clean SHOW_COLS (fix smart quote issue + typo)
 SHOW_COLS = [
     "ticker","name","sleeve","weight","price","mktcap",
     "forward_pe","trailing_pe","peg","ps","pb","fcf_yield",
-    "rev_cagr_3y”","eps_cagr_3y","oper_margin","roe",
+    "rev_cagr_3y","eps_cagr_3y","oper_margin","roe",
     "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
     "expected_growth","implied_growth","expectation_gap",
     "tanaka_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
 ]
-
-# NOTE: Fix for accidental smart quote in rev_cagr_3y”" above:
-SHOW_COLS = [c.replace("”", "").replace("“", "") for c in SHOW_COLS]
+SHOW_COLS = [c.replace("”", "").replace("“", "").replace('"', "").strip() for c in SHOW_COLS]
 
 REQUIRED_COLS = set(SHOW_COLS + ["weight_dec"])
 
@@ -195,11 +195,41 @@ def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
     for c in REQUIRED_COLS:
         if c not in df.columns:
             df[c] = np.nan
-    # numeric coercion for key columns
     for c in ["weight", "tanaka_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
         if c in df.columns:
             df[c] = df[c].apply(safe_float)
     return df
+
+# Rolling alpha/beta helper (used in panel 5b)
+def rolling_beta_alpha(asset_ret: pd.Series, bench_ret: pd.Series, window: int = 60, periods_per_year: int = 252):
+    df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
+    if df2.shape[0] < window + 5:
+        return pd.DataFrame()
+
+    a = df2.iloc[:, 0]
+    b = df2.iloc[:, 1]
+
+    cov_ab = a.rolling(window).cov(b)
+    var_b = b.rolling(window).var()
+    beta = cov_ab / var_b
+
+    mean_a = a.rolling(window).mean()
+    mean_b = b.rolling(window).mean()
+    alpha_daily = mean_a - beta * mean_b
+
+    corr = a.rolling(window).corr(b)
+    r2 = corr ** 2
+
+    alpha_annual = (1.0 + alpha_daily) ** periods_per_year - 1.0
+
+    out = pd.DataFrame({
+        "beta": beta,
+        "alpha_daily": alpha_daily,
+        "alpha_annual": alpha_annual,
+        "r2": r2,
+        "corr": corr
+    }).dropna(how="all")
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FLAGS – Variante A: Klassifikation + HTML Badges
@@ -241,7 +271,6 @@ def classify_flags(row):
     return out
 
 def render_flag_badges(flags):
-    # IMPORTANT: MUST return HTML <span> badges, not newlines
     if not flags:
         return "—"
 
@@ -463,7 +492,7 @@ def compute_total_score(row: pd.Series):
 
     wsum, wtot = 0.0, 0.0
     for k, v in subs.items():
-        if np.isnan(v): 
+        if np.isnan(v):
             continue
         wsum += weights.get(k, 0.0) * v
         wtot += weights.get(k, 0.0)
@@ -525,13 +554,11 @@ def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
         return pd.DataFrame()
 
     if isinstance(data.columns, pd.MultiIndex):
-        # Prefer Close
         if "Close" in data.columns.get_level_values(0):
             px_ = data["Close"].copy()
         else:
             px_ = data.xs(data.columns.levels[0][0], axis=1, level=0).copy()
     else:
-        # single ticker
         if "Close" in data.columns:
             px_ = data[["Close"]].copy()
             px_.columns = [tickers[0]]
@@ -539,16 +566,38 @@ def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
             px_ = data.copy()
     return px_.dropna(how="all")
 
-def compute_beta_corr(asset_ret: pd.Series, bench_ret: pd.Series) -> tuple[float, float]:
+def compute_regression_metrics(asset_ret: pd.Series, bench_ret: pd.Series, periods_per_year: int = 252):
     df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
     if df2.shape[0] < 60:
-        return np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
     a = df2.iloc[:, 0].values
     b = df2.iloc[:, 1].values
+
     var_b = np.var(b, ddof=1)
-    beta = np.cov(a, b, ddof=1)[0, 1] / var_b if var_b > 0 else np.nan
-    corr = np.corrcoef(a, b)[0, 1]
-    return float(beta), float(corr)
+    if var_b <= 0:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+
+    cov_ab = np.cov(a, b, ddof=1)[0, 1]
+    beta = cov_ab / var_b
+    alpha_daily = float(np.mean(a) - beta * np.mean(b))
+
+    corr = float(np.corrcoef(a, b)[0, 1])
+    r2 = float(corr ** 2) if not np.isnan(corr) else np.nan
+
+    alpha_annual = float((1.0 + alpha_daily) ** periods_per_year - 1.0)
+    return float(beta), corr, r2, alpha_daily, alpha_annual
+
+def tracking_error_and_ir(asset_ret: pd.Series, bench_ret: pd.Series, periods_per_year: int = 252):
+    df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
+    if df2.shape[0] < 60:
+        return np.nan, np.nan, np.nan
+
+    active = df2.iloc[:, 0] - df2.iloc[:, 1]
+    te = float(np.std(active, ddof=1) * np.sqrt(periods_per_year))
+    ar = float(np.mean(active) * periods_per_year)
+    ir = float(ar / te) if te > 0 else np.nan
+    return te, ar, ir
 
 def portfolio_returns_from_prices(px: pd.DataFrame, weights_pct: pd.Series) -> pd.Series:
     rets = px.pct_change().dropna(how="all")
@@ -844,41 +893,79 @@ else:
     dax_ret = ret_all[bench_dax].dropna() if bench_dax in ret_all.columns else pd.Series(dtype=float)
 
     tmp = pd.concat([port_ret, sp_ret.rename("SPX"), dax_ret.rename("DAX")], axis=1).dropna()
+
     if tmp.shape[0] < 60:
         st.warning("Zu wenig überlappende Datenpunkte für saubere Schätzung.")
     else:
-        port_beta_sp, port_corr_sp = compute_beta_corr(tmp["PORT"], tmp["SPX"])
-        port_beta_dax, port_corr_dax = compute_beta_corr(tmp["PORT"], tmp["DAX"])
+        port_beta_sp, port_corr_sp, port_r2_sp, port_alpha_d_sp, port_alpha_a_sp = compute_regression_metrics(tmp["PORT"], tmp["SPX"])
+        port_beta_dax, port_corr_dax, port_r2_dax, port_alpha_d_dax, port_alpha_a_dax = compute_regression_metrics(tmp["PORT"], tmp["DAX"])
+
+        te_sp, ar_sp, ir_sp = tracking_error_and_ir(tmp["PORT"], tmp["SPX"])
+        te_dx, ar_dx, ir_dx = tracking_error_and_ir(tmp["PORT"], tmp["DAX"])
 
         m1, m2, m3, m4 = st.columns(4, gap="large")
-        m1.metric("Portfolio Beta vs S&P 500", f"{port_beta_sp:.2f}" if not np.isnan(port_beta_sp) else "—")
-        m2.metric("Portfolio Corr vs S&P 500", f"{port_corr_sp:.2f}" if not np.isnan(port_corr_sp) else "—")
-        m3.metric("Portfolio Beta vs DAX", f"{port_beta_dax:.2f}" if not np.isnan(port_beta_dax) else "—")
-        m4.metric("Portfolio Corr vs DAX", f"{port_corr_dax:.2f}" if not np.isnan(port_corr_dax) else "—")
+        m1.metric("Beta vs S&P 500", f"{port_beta_sp:.2f}" if not np.isnan(port_beta_sp) else "—")
+        m2.metric("Corr vs S&P 500", f"{port_corr_sp:.2f}" if not np.isnan(port_corr_sp) else "—")
+        m3.metric("R² vs S&P 500", f"{port_r2_sp:.2f}" if not np.isnan(port_r2_sp) else "—")
+        m4.metric("Alpha p.a. vs S&P 500", f"{port_alpha_a_sp*100:.1f}%" if not np.isnan(port_alpha_a_sp) else "—")
 
+        m5, m6, m7, m8 = st.columns(4, gap="large")
+        m5.metric("Beta vs DAX", f"{port_beta_dax:.2f}" if not np.isnan(port_beta_dax) else "—")
+        m6.metric("Corr vs DAX", f"{port_corr_dax:.2f}" if not np.isnan(port_corr_dax) else "—")
+        m7.metric("R² vs DAX", f"{port_r2_dax:.2f}" if not np.isnan(port_r2_dax) else "—")
+        m8.metric("Alpha p.a. vs DAX", f"{port_alpha_a_dax*100:.1f}%" if not np.isnan(port_alpha_a_dax) else "—")
+
+        t1, t2, t3, t4 = st.columns(4, gap="large")
+        t1.metric("Tracking Error p.a. vs S&P 500", f"{te_sp*100:.1f}%" if not np.isnan(te_sp) else "—")
+        t2.metric("Active Return p.a. vs S&P 500", f"{ar_sp*100:.1f}%" if not np.isnan(ar_sp) else "—")
+        t3.metric("Info Ratio vs S&P 500", f"{ir_sp:.2f}" if not np.isnan(ir_sp) else "—")
+        t4.metric(" ", " ")
+
+        # Position-level regression table
         rows_b = []
         for t in tickers_list:
             if t not in ret_all.columns:
                 continue
+
             a = ret_all[t].dropna()
             b1 = ret_all[bench_sp].dropna() if bench_sp in ret_all.columns else pd.Series(dtype=float)
             b2 = ret_all[bench_dax].dropna() if bench_dax in ret_all.columns else pd.Series(dtype=float)
 
-            beta_sp, corr_sp = compute_beta_corr(a, b1) if not b1.empty else (np.nan, np.nan)
-            beta_dx, corr_dx = compute_beta_corr(a, b2) if not b2.empty else (np.nan, np.nan)
+            if not b1.empty:
+                beta_sp_i, corr_sp_i, r2_sp_i, alpha_d_sp_i, alpha_a_sp_i = compute_regression_metrics(a, b1)
+                te_sp_i, ar_sp_i, ir_sp_i = tracking_error_and_ir(a, b1)
+            else:
+                beta_sp_i = corr_sp_i = r2_sp_i = alpha_d_sp_i = alpha_a_sp_i = np.nan
+                te_sp_i = ar_sp_i = ir_sp_i = np.nan
+
+            if not b2.empty:
+                beta_dx_i, corr_dx_i, r2_dx_i, alpha_d_dx_i, alpha_a_dx_i = compute_regression_metrics(a, b2)
+                te_dx_i, ar_dx_i, ir_dx_i = tracking_error_and_ir(a, b2)
+            else:
+                beta_dx_i = corr_dx_i = r2_dx_i = alpha_d_dx_i = alpha_a_dx_i = np.nan
+                te_dx_i = ar_dx_i = ir_dx_i = np.nan
 
             rows_b.append({
                 "ticker": t,
                 "weight_%": float(w_series.get(t, 0.0)),
-                "beta_spx": beta_sp,
-                "corr_spx": corr_sp,
-                "beta_dax": beta_dx,
-                "corr_dax": corr_dx,
+                "beta_spx": beta_sp_i,
+                "corr_spx": corr_sp_i,
+                "r2_spx": r2_sp_i,
+                "alpha_pa_spx": alpha_a_sp_i,
+                "te_pa_spx": te_sp_i,
+                "ir_spx": ir_sp_i,
+                "beta_dax": beta_dx_i,
+                "corr_dax": corr_dx_i,
+                "r2_dax": r2_dx_i,
+                "alpha_pa_dax": alpha_a_dx_i,
+                "te_pa_dax": te_dx_i,
+                "ir_dax": ir_dx_i,
             })
 
         df_b = pd.DataFrame(rows_b).sort_values("weight_%", ascending=False)
         st.dataframe(df_b, use_container_width=True, hide_index=True)
 
+        # Rolling correlation chart (kept)
         roll = tmp.copy()
         roll["corr_spx_roll"] = roll["PORT"].rolling(rolling_win).corr(roll["SPX"])
         roll["corr_dax_roll"] = roll["PORT"].rolling(rolling_win).corr(roll["DAX"])
@@ -893,6 +980,76 @@ else:
         )
         st.plotly_chart(fig, use_container_width=True)
 
+        # ─────────────────────────────────────────────────────────────
+        # Rolling Alpha & Beta (nur Linien + Schwellen)
+        # ─────────────────────────────────────────────────────────────
+        st.markdown("### Rolling Alpha & Beta (Portfolio vs Benchmarks)")
+
+        w1, w2 = st.columns([1, 1], gap="large")
+        with w1:
+            win1 = st.selectbox("Rolling Window 1", [30, 60, 90, 126], index=1, key="roll_win1")
+        with w2:
+            win2 = st.selectbox("Rolling Window 2", [60, 90, 126, 252], index=2, key="roll_win2")
+
+        roll_sp_1 = rolling_beta_alpha(tmp["PORT"], tmp["SPX"], window=int(win1))
+        roll_sp_2 = rolling_beta_alpha(tmp["PORT"], tmp["SPX"], window=int(win2))
+        roll_dx_1 = rolling_beta_alpha(tmp["PORT"], tmp["DAX"], window=int(win1))
+        roll_dx_2 = rolling_beta_alpha(tmp["PORT"], tmp["DAX"], window=int(win2))
+
+        c1, c2 = st.columns(2, gap="large")
+
+        # --- SPX chart
+        with c1:
+            fig = go.Figure()
+
+            if not roll_sp_1.empty:
+                fig.add_trace(go.Scatter(x=roll_sp_1.index, y=roll_sp_1["beta"], name=f"Beta vs SPX ({win1}D)"))
+                fig.add_trace(go.Scatter(x=roll_sp_1.index, y=roll_sp_1["alpha_annual"]*100, name=f"Alpha p.a. vs SPX ({win1}D)", yaxis="y2"))
+            if not roll_sp_2.empty:
+                fig.add_trace(go.Scatter(x=roll_sp_2.index, y=roll_sp_2["beta"], name=f"Beta vs SPX ({win2}D)", line=dict(dash="dot")))
+                fig.add_trace(go.Scatter(x=roll_sp_2.index, y=roll_sp_2["alpha_annual"]*100, name=f"Alpha p.a. vs SPX ({win2}D)", yaxis="y2", line=dict(dash="dot")))
+
+            # Alpha reference lines on y2 (values in %)
+            fig.add_hline(y=0, yref="y2", line_dash="dash", line_color="rgba(0,0,0,0.55)",
+                          annotation_text="Alpha = 0%", annotation_position="top right")
+            fig.add_hline(y=-10, yref="y2", line_dash="dot", line_color="rgba(220,38,38,0.85)",
+                          annotation_text="Alpha = -10%", annotation_position="bottom right")
+
+            fig.update_layout(
+                title="Rolling Beta (left) & Rolling Alpha p.a. (right) — vs S&P 500",
+                margin=dict(l=10, r=10, t=50, b=10),
+                yaxis=dict(title="Beta"),
+                yaxis2=dict(title="Alpha p.a. (%)", overlaying="y", side="right"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # --- DAX chart
+        with c2:
+            fig = go.Figure()
+
+            if not roll_dx_1.empty:
+                fig.add_trace(go.Scatter(x=roll_dx_1.index, y=roll_dx_1["beta"], name=f"Beta vs DAX ({win1}D)"))
+                fig.add_trace(go.Scatter(x=roll_dx_1.index, y=roll_dx_1["alpha_annual"]*100, name=f"Alpha p.a. vs DAX ({win1}D)", yaxis="y2"))
+            if not roll_dx_2.empty:
+                fig.add_trace(go.Scatter(x=roll_dx_2.index, y=roll_dx_2["beta"], name=f"Beta vs DAX ({win2}D)", line=dict(dash="dot")))
+                fig.add_trace(go.Scatter(x=roll_dx_2.index, y=roll_dx_2["alpha_annual"]*100, name=f"Alpha p.a. vs DAX ({win2}D)", yaxis="y2", line=dict(dash="dot")))
+
+            # Alpha reference lines on y2 (values in %)
+            fig.add_hline(y=0, yref="y2", line_dash="dash", line_color="rgba(0,0,0,0.55)",
+                          annotation_text="Alpha = 0%", annotation_position="top right")
+            fig.add_hline(y=-10, yref="y2", line_dash="dot", line_color="rgba(220,38,38,0.85)",
+                          annotation_text="Alpha = -10%", annotation_position="bottom right")
+
+            fig.update_layout(
+                title="Rolling Beta (left) & Rolling Alpha p.a. (right) — vs DAX",
+                margin=dict(l=10, r=10, t=50, b=10),
+                yaxis=dict(title="Beta"),
+                yaxis2=dict(title="Alpha p.a. (%)", overlaying="y", side="right"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ACTION PANEL – HTML Badges (Grün/Rot/Gelb)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -902,10 +1059,6 @@ st.subheader("6) Action Panel (Tanaka-Style Flags)")
 df_flags = df.copy()
 df_flags["flag_objects"] = df_flags.apply(classify_flags, axis=1)
 df_flags["flags_badges"] = df_flags["flag_objects"].apply(render_flag_badges)
-
-# DEBUG (optional): zeigt ob HTML wirklich in der Spalte steckt
-# st.write("DEBUG flags_badges sample:", df_flags["flags_badges"].iloc[0])
-
 df_flags = df_flags.sort_values("tanaka_score", ascending=False)
 
 view = df_flags[
@@ -914,7 +1067,6 @@ view = df_flags[
      "flags_badges"]
 ].copy()
 
-# WICHTIG: Hier bewusst HTML-Render statt st.dataframe, sonst keine Farben
 st.markdown(view.to_html(escape=False, index=False), unsafe_allow_html=True)
 
 st.caption("Hinweis: Grün = Chance, Rot = Risiko, Gelb = Prozess/Monitoring.")
