@@ -1,11 +1,13 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Tanaka-Style Scorecard – Screenshot-Style Sidebar + Weights Editor + Auto Yahoo
-# Stabilized version: guards + required cols + safe charts
+# Tanaka-Style Scorecard – Screenshot-Style Sidebar + Weights + Yahoo + Charts
+# + Beta/Correlation vs S&P 500 & DAX
+# + Action Panel mit farbigen Badges (HTML)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
 import re
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -22,6 +24,8 @@ st.markdown(
     """
     <style>
       .block-container { padding-top: 1.1rem; padding-bottom: 2rem; }
+
+      /* Metric cards */
       div[data-testid="stMetric"] {
         background: #ffffff;
         border: 1px solid #e6e9ef;
@@ -31,32 +35,27 @@ st.markdown(
       }
       div[data-testid="stMetric"] > label { color: #6b7280 !important; font-weight: 500 !important; }
       div[data-testid="stMetric"] span { color: #111827 !important; font-weight: 650 !important; }
-      .small-note { color: rgba(17,24,39,0.70); font-size: 0.92rem; }
-      code { font-size: 0.9rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-st.markdown(
-    """
-    <style>
-    table { width:100%; border-collapse: collapse; }
-    thead th {
-      background:#f9fafb;
-      border-bottom: 1px solid #e5e7eb;
-      padding: 10px;
-      text-align:left;
-      font-weight: 700;
-      color:#111827;
-    }
-    tbody td {
-      border-bottom: 1px solid #eef2f7;
-      padding: 10px;
-      vertical-align: middle;
-      color:#111827;
-    }
-    tbody tr:hover { background:#f9fafb; }
+      /* HTML tables (for badges) */
+      table { width:100%; border-collapse: collapse; }
+      thead th {
+        background:#f9fafb;
+        border-bottom: 1px solid #e5e7eb;
+        padding: 10px;
+        text-align:left;
+        font-weight: 700;
+        color:#111827;
+        font-size: 0.92rem;
+      }
+      tbody td {
+        border-bottom: 1px solid #eef2f7;
+        padding: 10px;
+        vertical-align: middle;
+        color:#111827;
+        font-size: 0.92rem;
+      }
+      tbody tr:hover { background:#f9fafb; }
+      code { font-size: 0.9rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -77,15 +76,17 @@ BASE_WEIGHTS = {
 
 DEFAULT_TICKERS = ["LULU", "REI", "SRPT", "CAG", "NVO", "PYPL", "VIXL", "NVDA"]
 
-# Anzeige-Spalten (wichtig: wird auch als Required-Cols verwendet)
 SHOW_COLS = [
     "ticker","name","sleeve","weight","price","mktcap",
     "forward_pe","trailing_pe","peg","ps","pb","fcf_yield",
-    "rev_cagr_3y","eps_cagr_3y","oper_margin","roe",
+    "rev_cagr_3y”","eps_cagr_3y","oper_margin","roe",
     "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
     "expected_growth","implied_growth","expectation_gap",
     "tanaka_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
 ]
+
+# NOTE: Fix for accidental smart quote in rev_cagr_3y”" above:
+SHOW_COLS = [c.replace("”", "").replace("“", "") for c in SHOW_COLS]
 
 REQUIRED_COLS = set(SHOW_COLS + ["weight_dec"])
 
@@ -190,8 +191,18 @@ def sleeve_auto_heuristic(info: dict):
         return "Financials"
     return "Other"
 
+def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
+    for c in REQUIRED_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    # numeric coercion for key columns
+    for c in ["weight", "tanaka_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
+        if c in df.columns:
+            df[c] = df[c].apply(safe_float)
+    return df
+
 # ─────────────────────────────────────────────────────────────────────────────
-# FLAGS (Variante A) – Badges
+# FLAGS – Variante A: Klassifikation + HTML Badges
 # ─────────────────────────────────────────────────────────────────────────────
 def classify_flags(row):
     out = []
@@ -230,6 +241,7 @@ def classify_flags(row):
     return out
 
 def render_flag_badges(flags):
+    # IMPORTANT: MUST return HTML <span> badges, not newlines
     if not flags:
         return "—"
 
@@ -243,35 +255,15 @@ def render_flag_badges(flags):
             color, bg = "#92400e", "#fef3c7"   # amber
 
         parts.append(
-            f"""
-            <span style="
-                background:{bg};
-                color:{color};
-                padding:4px 10px;
-                border-radius:12px;
-                font-size:0.75rem;
-                font-weight:600;
-                margin-right:6px;
-                white-space:nowrap;
-                display:inline-block;
-                line-height:1.4;
-            ">{label}</span>
-            """
+            f'<span style="background:{bg};color:{color};padding:4px 10px;'
+            f'border-radius:12px;font-size:0.75rem;font-weight:650;'
+            f'margin-right:6px;white-space:nowrap;display:inline-block;line-height:1.4;">'
+            f'{label}</span>'
         )
     return "".join(parts)
 
-def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
-    for c in REQUIRED_COLS:
-        if c not in df.columns:
-            df[c] = np.nan
-    # numeric coercion for critical cols
-    for c in ["weight", "tanaka_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
-        if c in df.columns:
-            df[c] = df[c].apply(safe_float)
-    return df
-
 # ─────────────────────────────────────────────────────────────────────────────
-# YF fetch (cached)
+# YF FETCH (cached)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info(ticker: str):
@@ -471,7 +463,8 @@ def compute_total_score(row: pd.Series):
 
     wsum, wtot = 0.0, 0.0
     for k, v in subs.items():
-        if np.isnan(v): continue
+        if np.isnan(v): 
+            continue
         wsum += weights.get(k, 0.0) * v
         wtot += weights.get(k, 0.0)
     if wtot <= 0:
@@ -523,19 +516,59 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     return row
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR – Screenshot-Flow
+# BETA/CORR PANEL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
+    data = yf.download(tickers=tickers, period=period, auto_adjust=True, progress=False)
+    if data is None or len(data) == 0:
+        return pd.DataFrame()
+
+    if isinstance(data.columns, pd.MultiIndex):
+        # Prefer Close
+        if "Close" in data.columns.get_level_values(0):
+            px_ = data["Close"].copy()
+        else:
+            px_ = data.xs(data.columns.levels[0][0], axis=1, level=0).copy()
+    else:
+        # single ticker
+        if "Close" in data.columns:
+            px_ = data[["Close"]].copy()
+            px_.columns = [tickers[0]]
+        else:
+            px_ = data.copy()
+    return px_.dropna(how="all")
+
+def compute_beta_corr(asset_ret: pd.Series, bench_ret: pd.Series) -> tuple[float, float]:
+    df2 = pd.concat([asset_ret, bench_ret], axis=1).dropna()
+    if df2.shape[0] < 60:
+        return np.nan, np.nan
+    a = df2.iloc[:, 0].values
+    b = df2.iloc[:, 1].values
+    var_b = np.var(b, ddof=1)
+    beta = np.cov(a, b, ddof=1)[0, 1] / var_b if var_b > 0 else np.nan
+    corr = np.corrcoef(a, b)[0, 1]
+    return float(beta), float(corr)
+
+def portfolio_returns_from_prices(px: pd.DataFrame, weights_pct: pd.Series) -> pd.Series:
+    rets = px.pct_change().dropna(how="all")
+    common = [c for c in rets.columns if c in weights_pct.index]
+    if len(common) == 0:
+        return pd.Series(dtype=float)
+    w = (weights_pct.loc[common] / 100.0).astype(float)
+    w = w / w.sum() if w.sum() > 0 else w
+    port = (rets[common].mul(w, axis=1)).sum(axis=1)
+    port.name = "PORT"
+    return port
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR – Screenshot-Style
 # ─────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("CSV-Dateien")
-
-uploaded = st.sidebar.file_uploader(
-    "Drag and drop files here",
-    type=["csv"],
-    accept_multiple_files=False
-)
-
+uploaded = st.sidebar.file_uploader("Drag and drop files here", type=["csv"], accept_multiple_files=False)
 manual = st.sidebar.text_input("Weitere Ticker manuell hinzufügen (Komma-getrennt)", value="")
 
-st.sidebar.caption("")  # spacing
+st.sidebar.caption("")
 shuffle = st.sidebar.checkbox("Zufällig mischen", value=False)
 max_n = st.sidebar.number_input("Max. Anzahl (0 = alle)", min_value=0, value=0, step=1)
 
@@ -566,18 +599,14 @@ if max_n and max_n > 0:
 
 st.sidebar.caption(f"Gefundene Ticker: {len(combined)}")
 
-selected = st.sidebar.multiselect(
-    "Auswahl verfeinern",
-    options=combined,
-    default=combined
-)
+selected = st.sidebar.multiselect("Auswahl verfeinern", options=combined, default=combined)
 
 df_out = pd.DataFrame({"ticker": selected})
 st.sidebar.download_button(
     "Kombinierte Ticker als CSV",
     data=df_out.to_csv(index=False).encode("utf-8"),
     file_name="combined_tickers.csv",
-    mime="text/csv"
+    mime="text/csv",
 )
 
 st.sidebar.markdown("---")
@@ -590,13 +619,13 @@ run = st.sidebar.button("Load / Refresh", type="primary")
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 st.title("📈 Tanaka-Style Scorecard")
-st.caption("Workflow: Ticker rein → Gewicht setzen → Auto Yahoo Pull → Score + Charts + Action Panel.")
+st.caption("Ticker rein → Gewicht setzen → Yahoo Pull → Score, Charts, Risk-Panel, Flags.")
 
 if len(selected) == 0:
     st.warning("Keine Ticker selektiert.")
     st.stop()
 
-# Initialize weights table session state
+# Init weights state
 if "weights_df" not in st.session_state:
     eq_w = 100.0 / len(selected)
     st.session_state["weights_df"] = pd.DataFrame(
@@ -615,7 +644,7 @@ for t in selected:
     )
 st.session_state["weights_df"] = pd.DataFrame(new_rows)
 
-st.subheader("1) Weights (nur Ticker + Gewicht)")
+st.subheader("1) Weights (Ticker + Gewicht)")
 edited = st.data_editor(
     st.session_state["weights_df"],
     use_container_width=True,
@@ -629,10 +658,10 @@ edited = st.data_editor(
 )
 
 df_in = edited.copy()
+df_in["ticker"] = df_in["ticker"].astype(str).apply(sanitize_ticker)
 df_in["weight"] = df_in["weight"].apply(safe_float).fillna(0.0)
 df_in["sleeve"] = df_in["sleeve"].astype(str).str.strip()
 df_in.loc[~df_in["sleeve"].isin(SLEEVES), "sleeve"] = "Auto"
-df_in["ticker"] = df_in["ticker"].astype(str).apply(sanitize_ticker)
 df_in = df_in[df_in["ticker"].astype(str).str.strip() != ""].reset_index(drop=True)
 
 if auto_normalize:
@@ -641,7 +670,7 @@ if auto_normalize:
 st.session_state["weights_df"] = df_in
 
 if not run and "ran_once" not in st.session_state:
-    st.info("Stell die Weights ein und klicke links auf **Load / Refresh**.")
+    st.info("Gewichte einstellen und links **Load / Refresh** drücken.")
     st.stop()
 st.session_state["ran_once"] = True
 
@@ -652,52 +681,45 @@ st.markdown("---")
 st.subheader("2) KPIs & Tanaka Score")
 
 rows = []
-with st.spinner("Pulling Yahoo Finance fundamentals & computing scores …"):
+with st.spinner("Yahoo Finance Daten laden & Score berechnen …"):
     for _, r in df_in.iterrows():
         tkr = r["ticker"]
         wt = float(safe_float(r["weight"]))
         sl = r.get("sleeve", "Auto")
         if not auto_fetch:
-            # Minimal row; rest is filled by ensure_required_cols()
             rows.append({"ticker": tkr, "weight": wt, "sleeve": sl, "name": ""})
         else:
             rows.append(build_row(tkr, sl, wt))
 
-df = pd.DataFrame(rows)
-df = ensure_required_cols(df)
+df = ensure_required_cols(pd.DataFrame(rows))
+df["weight_dec"] = df["weight"].fillna(0.0) / 100.0
 
-df["weight_dec"] = df["weight"].apply(safe_float).fillna(0.0) / 100.0
-
-# Guard: wenn kein Score (z.B. auto_fetch aus), bleibt port_score NaN statt Crash
+port_score = np.nan
 if "tanaka_score" in df.columns and df["tanaka_score"].notna().any():
     port_score = float(np.nansum(df["tanaka_score"] * df["weight_dec"]))
-else:
-    port_score = np.nan
 
-# Guard: leeres df
 if df.empty:
-    st.warning("Keine Datenpunkte – prüfe Ticker / CSV / Auswahl.")
+    st.warning("Keine Datenpunkte – prüfe Ticker-Auswahl.")
     st.stop()
 
-# Metrics
 m1, m2, m3, m4 = st.columns(4, gap="large")
 m1.metric("Portfolio Tanaka Score (wtd.)", f"{port_score:.1f}" if not np.isnan(port_score) else "—")
 m2.metric("Names", f"{len(df)}")
 
+top_sleeve = "—"
 if df["sleeve"].notna().any():
-    top_sleeve = df.groupby("sleeve")["weight"].sum().sort_values(ascending=False).index[0]
-else:
-    top_sleeve = "—"
+    gs = df.groupby("sleeve")["weight"].sum().sort_values(ascending=False)
+    if len(gs) > 0:
+        top_sleeve = gs.index[0]
 m3.metric("Top Sleeve", top_sleeve)
 
 m4.metric("Coverage", f"{int(df['tanaka_score'].notna().sum())}/{len(df)}" if "tanaka_score" in df.columns else f"0/{len(df)}")
 
-# Table
 st.dataframe(df[SHOW_COLS].sort_values("weight", ascending=False), use_container_width=True, hide_index=True)
 st.download_button("Download KPI Table (CSV)", df[SHOW_COLS].to_csv(index=False).encode("utf-8"), "tanaka_scorecard.csv", "text/csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHARTS (guarded)
+# CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("3) Charts")
@@ -724,14 +746,14 @@ with c2:
 
 c3, c4 = st.columns([1.25, 0.75], gap="large")
 with c3:
-    g = df["eps_cagr_3y"].where(df["eps_cagr_3y"].notna(), df["rev_cagr_3y"])
+    gproxy = df["eps_cagr_3y"].where(df["eps_cagr_3y"].notna(), df["rev_cagr_3y"])
     scatter = df.copy()
-    scatter["growth_proxy"] = g
+    scatter["growth_proxy"] = gproxy
     fig = px.scatter(
         scatter, x="forward_pe", y="growth_proxy",
         size="weight", color="sleeve", hover_name="ticker",
         hover_data={"name": True, "tanaka_score": True, "weight": True, "forward_pe": True, "growth_proxy": True},
-        title="Valuation vs Growth (proxy) — 'Undervalued Growth' Map",
+        title="Valuation vs Growth (proxy) — Undervalued Growth Map",
     )
     fig.update_yaxes(tickformat=".0%")
     fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
@@ -764,7 +786,7 @@ fig = px.scatter(
     df, x="implied_growth", y="expected_growth",
     size="weight", color="sleeve", hover_name="ticker",
     hover_data={"name": True, "tanaka_score": True, "expectation_gap": True},
-    title="Expected vs Implied Growth (Tanaka Expectation-Gap Overlay)",
+    title="Expected vs Implied Growth (Expectation-Gap Overlay)",
 )
 fig.add_shape(type="line", x0=0, y0=0, x1=0.30, y1=0.30, line=dict(dash="dash"))
 fig.update_xaxes(tickformat=".0%", range=[0, 0.30])
@@ -775,20 +797,104 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 st.subheader("5) Heatmap (0–100)")
 
-try:
-    heat = df[["ticker","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap","tanaka_score"]].set_index("ticker")
-    # Guard: wenn komplett NaN, dann keine Heatmap rendern
-    if heat.dropna(how="all").empty:
-        st.info("Heatmap: keine Subscore-Daten (z.B. auto_fetch aus oder Yahoo Coverage).")
-    else:
-        fig = px.imshow(heat.T, aspect="auto", title="Sub-scores and Total Score (0–100)")
-        fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-except Exception as e:
-    st.warning(f"Heatmap konnte nicht gerendert werden: {e}")
+heat_cols = ["ticker","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap","tanaka_score"]
+heat = df[heat_cols].set_index("ticker")
+if heat.dropna(how="all").empty:
+    st.info("Heatmap: keine Subscore-Daten (z.B. Yahoo Coverage / auto_fetch).")
+else:
+    fig = px.imshow(heat.T, aspect="auto", title="Sub-scores & Total Score (0–100)")
+    fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ACTION PANEL (Badges)
+# 5b) Beta / Correlation Panel vs S&P500 & DAX
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("5b) Beta / Correlation vs S&P 500 & DAX")
+
+colA, colB, colC = st.columns([1, 1, 1], gap="large")
+with colA:
+    lookback = st.selectbox("Lookback", ["6mo", "1y", "2y", "5y"], index=2)
+with colB:
+    rolling_win = st.selectbox("Rolling Window (Trading Days)", [30, 60, 90, 126], index=1)
+with colC:
+    use_log = st.toggle("Log Returns", value=False)
+
+bench_sp = "^GSPC"
+bench_dax = "^GDAXI"
+
+tickers_list = df["ticker"].astype(str).str.upper().str.strip().tolist()
+need = list(dict.fromkeys(tickers_list + [bench_sp, bench_dax]))
+
+with st.spinner("Preisdaten laden (Beta/Korrelation) …"):
+    px_all = fetch_prices(need, period=lookback)
+
+if px_all.empty or px_all.shape[0] < 80:
+    st.warning("Zu wenig Preisdaten für Beta/Korrelation (oder Yahoo liefert nichts).")
+else:
+    if use_log:
+        ret_all = np.log(px_all).diff().dropna(how="all")
+    else:
+        ret_all = px_all.pct_change().dropna(how="all")
+
+    w_series = df.set_index("ticker")["weight"].apply(safe_float).fillna(0.0)
+    port_ret = portfolio_returns_from_prices(px_all[tickers_list], w_series)
+
+    sp_ret = ret_all[bench_sp].dropna() if bench_sp in ret_all.columns else pd.Series(dtype=float)
+    dax_ret = ret_all[bench_dax].dropna() if bench_dax in ret_all.columns else pd.Series(dtype=float)
+
+    tmp = pd.concat([port_ret, sp_ret.rename("SPX"), dax_ret.rename("DAX")], axis=1).dropna()
+    if tmp.shape[0] < 60:
+        st.warning("Zu wenig überlappende Datenpunkte für saubere Schätzung.")
+    else:
+        port_beta_sp, port_corr_sp = compute_beta_corr(tmp["PORT"], tmp["SPX"])
+        port_beta_dax, port_corr_dax = compute_beta_corr(tmp["PORT"], tmp["DAX"])
+
+        m1, m2, m3, m4 = st.columns(4, gap="large")
+        m1.metric("Portfolio Beta vs S&P 500", f"{port_beta_sp:.2f}" if not np.isnan(port_beta_sp) else "—")
+        m2.metric("Portfolio Corr vs S&P 500", f"{port_corr_sp:.2f}" if not np.isnan(port_corr_sp) else "—")
+        m3.metric("Portfolio Beta vs DAX", f"{port_beta_dax:.2f}" if not np.isnan(port_beta_dax) else "—")
+        m4.metric("Portfolio Corr vs DAX", f"{port_corr_dax:.2f}" if not np.isnan(port_corr_dax) else "—")
+
+        rows_b = []
+        for t in tickers_list:
+            if t not in ret_all.columns:
+                continue
+            a = ret_all[t].dropna()
+            b1 = ret_all[bench_sp].dropna() if bench_sp in ret_all.columns else pd.Series(dtype=float)
+            b2 = ret_all[bench_dax].dropna() if bench_dax in ret_all.columns else pd.Series(dtype=float)
+
+            beta_sp, corr_sp = compute_beta_corr(a, b1) if not b1.empty else (np.nan, np.nan)
+            beta_dx, corr_dx = compute_beta_corr(a, b2) if not b2.empty else (np.nan, np.nan)
+
+            rows_b.append({
+                "ticker": t,
+                "weight_%": float(w_series.get(t, 0.0)),
+                "beta_spx": beta_sp,
+                "corr_spx": corr_sp,
+                "beta_dax": beta_dx,
+                "corr_dax": corr_dx,
+            })
+
+        df_b = pd.DataFrame(rows_b).sort_values("weight_%", ascending=False)
+        st.dataframe(df_b, use_container_width=True, hide_index=True)
+
+        roll = tmp.copy()
+        roll["corr_spx_roll"] = roll["PORT"].rolling(rolling_win).corr(roll["SPX"])
+        roll["corr_dax_roll"] = roll["PORT"].rolling(rolling_win).corr(roll["DAX"])
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=roll.index, y=roll["corr_spx_roll"], name=f"Rolling Corr PORT vs SPX ({rolling_win}D)"))
+        fig.add_trace(go.Scatter(x=roll.index, y=roll["corr_dax_roll"], name=f"Rolling Corr PORT vs DAX ({rolling_win}D)"))
+        fig.update_layout(
+            title="Rolling Correlation (Portfolio vs Benchmarks)",
+            margin=dict(l=10, r=10, t=50, b=10),
+            yaxis=dict(range=[-1, 1]),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTION PANEL – HTML Badges (Grün/Rot/Gelb)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("6) Action Panel (Tanaka-Style Flags)")
@@ -796,6 +902,9 @@ st.subheader("6) Action Panel (Tanaka-Style Flags)")
 df_flags = df.copy()
 df_flags["flag_objects"] = df_flags.apply(classify_flags, axis=1)
 df_flags["flags_badges"] = df_flags["flag_objects"].apply(render_flag_badges)
+
+# DEBUG (optional): zeigt ob HTML wirklich in der Spalte steckt
+# st.write("DEBUG flags_badges sample:", df_flags["flags_badges"].iloc[0])
 
 df_flags = df_flags.sort_values("tanaka_score", ascending=False)
 
@@ -805,10 +914,8 @@ view = df_flags[
      "flags_badges"]
 ].copy()
 
-st.markdown(
-    view.to_html(escape=False, index=False, justify="left"),
-    unsafe_allow_html=True
-)
+# WICHTIG: Hier bewusst HTML-Render statt st.dataframe, sonst keine Farben
+st.markdown(view.to_html(escape=False, index=False), unsafe_allow_html=True)
 
 st.caption("Hinweis: Grün = Chance, Rot = Risiko, Gelb = Prozess/Monitoring.")
 st.caption("Research dashboard (education). Not investment advice. Yahoo Finance coverage varies; missing values are normal.")
