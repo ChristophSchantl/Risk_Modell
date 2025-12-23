@@ -36,6 +36,36 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+st.markdown(
+    """
+    <style>
+    table { width:100%; border-collapse: collapse; }
+    thead th {
+      background:#f9fafb;
+      border-bottom: 1px solid #e5e7eb;
+      padding: 10px;
+      text-align:left;
+      font-weight: 700;
+      color:#111827;
+    }
+    tbody td {
+      border-bottom: 1px solid #eef2f7;
+      padding: 10px;
+      vertical-align: middle;
+      color:#111827;
+    }
+    tbody tr:hover { background:#f9fafb; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+
+
+
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +98,80 @@ def safe_float(x):
         return float(x)
     except Exception:
         return np.nan
+
+def classify_flags(row):
+    out = []
+    score = safe_float(row.get("tanaka_score", np.nan))
+    fpe = safe_float(row.get("forward_pe", np.nan))
+    peg = safe_float(row.get("peg", np.nan))
+    vol = safe_float(row.get("vol_1y", np.nan))
+    runway = safe_float(row.get("cash_runway_months", np.nan))
+    nde = safe_float(row.get("net_debt_to_ebitda", np.nan))
+    exp_g = safe_float(row.get("expected_growth", np.nan))
+    impl_g = safe_float(row.get("implied_growth", np.nan))
+    gap = safe_float(row.get("expectation_gap", np.nan))
+
+    # Positive
+    if not np.isnan(score) and score >= 85:
+        out.append(("High Conviction", "positive"))
+    if (not np.isnan(peg) and peg <= 1.2) and (not np.isnan(score) and score >= 70):
+        out.append(("Undervalued-growth candidate", "positive"))
+    if not np.isnan(exp_g) and not np.isnan(impl_g) and (exp_g - impl_g) >= 0.05:
+        out.append(("Expectation Gap (exp > implied)", "positive"))
+    if not np.isnan(gap) and gap >= 0.10:
+        out.append(("Large Gap (>=10%)", "positive"))
+
+    # Neutral
+    if not np.isnan(fpe) and fpe >= 45 and not np.isnan(score) and score >= 75:
+        out.append(("Trim-check (Target P/E?)", "neutral"))
+
+    # Negative / Risk
+    if not np.isnan(vol) and vol >= 0.70:
+        out.append(("High vol", "negative"))
+    if not np.isnan(runway) and runway <= 12:
+        out.append(("Runway risk (<12m)", "negative"))
+    if not np.isnan(nde) and nde >= 4:
+        out.append(("Leverage risk (ND/EBITDA high)", "negative"))
+
+    return out
+
+def render_flag_badges(flags):
+    if not flags:
+        return "—"
+
+    parts = []
+    for label, kind in flags:
+        if kind == "positive":
+            color, bg = "#166534", "#dcfce7"   # green
+        elif kind == "negative":
+            color, bg = "#991b1b", "#fee2e2"   # red
+        else:
+            color, bg = "#92400e", "#fef3c7"   # amber
+
+        parts.append(
+            f"""
+            <span style="
+                background:{bg};
+                color:{color};
+                padding:4px 10px;
+                border-radius:12px;
+                font-size:0.75rem;
+                font-weight:600;
+                margin-right:6px;
+                white-space:nowrap;
+                display:inline-block;
+                line-height:1.4;
+            ">{label}</span>
+            """
+        )
+
+    return "".join(parts)
+
+
+
+
+
+
 
 def z_to_01(x, xmin, xmax):
     if np.isnan(x): return np.nan
@@ -661,42 +765,31 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 st.subheader("6) Action Panel (Tanaka-Style Flags)")
 
-flags = []
-for _, r in df.iterrows():
-    fpe = safe_float(r.get("forward_pe", np.nan))
-    peg = safe_float(r.get("peg", np.nan))
-    score = safe_float(r.get("tanaka_score", np.nan))
-    vol = safe_float(r.get("vol_1y", np.nan))
-    runway = safe_float(r.get("cash_runway_months", np.nan))
-    nde = safe_float(r.get("net_debt_to_ebitda", np.nan))
-    exp_g = safe_float(r.get("expected_growth", np.nan))
-    impl_g = safe_float(r.get("implied_growth", np.nan))
-    gap = safe_float(r.get("expectation_gap", np.nan))
+df_flags = df.copy()
+df_flags["flag_objects"] = df_flags.apply(classify_flags, axis=1)
+df_flags["flags_badges"] = df_flags["flag_objects"].apply(render_flag_badges)
 
-    flag = []
-    if not np.isnan(score) and score >= 85:
-        flag.append("High Conviction")
-    if not np.isnan(fpe) and fpe >= 45 and not np.isnan(score) and score >= 75:
-        flag.append("Trim-check (Target P/E?)")
-    if (not np.isnan(peg) and peg <= 1.2) and (not np.isnan(score) and score >= 70):
-        flag.append("Undervalued-growth candidate")
-    if not np.isnan(exp_g) and not np.isnan(impl_g) and (exp_g - impl_g) >= 0.05:
-        flag.append("Expectation Gap (exp > implied)")
-    if not np.isnan(gap) and gap >= 0.10:
-        flag.append("Large Gap (>=10%)")
-    if not np.isnan(vol) and vol >= 0.70:
-        flag.append("High vol")
-    if not np.isnan(runway) and runway <= 12:
-        flag.append("Runway risk (<12m)")
-    if not np.isnan(nde) and nde >= 4:
-        flag.append("Leverage risk (ND/EBITDA high)")
+# Optional: sort so dass zuerst "Risiko" oder "Chancen" oben sind
+# z.B. nach Score absteigend
+df_flags = df_flags.sort_values("tanaka_score", ascending=False)
 
-    flags.append(", ".join(flag) if flag else "—")
+# Wähle die Spalten, die du sehen willst
+view = df_flags[[
+    "ticker", "name", "sleeve", "weight", "tanaka_score",
+    "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
+    "flags_badges"
+]].copy()
 
-df_flags = df[
-    ["ticker","name","sleeve","weight","tanaka_score","forward_pe","peg","vol_1y","cash_runway_months","net_debt_to_ebitda","expected_growth","implied_growth","expectation_gap"]
-].copy()
-df_flags["flags"] = flags
+# HTML Tabelle (weil st.dataframe kein HTML rendert)
+st.markdown(
+    view.to_html(
+        escape=False,
+        index=False,
+        justify="left"
+    ),
+    unsafe_allow_html=True
+)
 
-st.dataframe(df_flags.sort_values("tanaka_score", ascending=False), use_container_width=True, hide_index=True)
+st.caption("Hinweis: Grün = Chance, Rot = Risiko, Gelb = Prozess/Monitoring.")
+
 st.caption("Research dashboard (education). Not investment advice. Yahoo Finance coverage varies; missing values are normal.")
