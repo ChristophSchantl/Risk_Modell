@@ -1,9 +1,11 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────────────────────
 # Tanaka-Style Scorecard – Screenshot-Style Sidebar + Weights Editor + Auto Yahoo
+# Stabilized version: guards + required cols + safe charts
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -36,7 +38,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 st.markdown(
     """
     <style>
@@ -57,14 +58,9 @@ st.markdown(
     }
     tbody tr:hover { background:#f9fafb; }
     </style>
-    """, unsafe_allow_html=True)
-
-
-
-
-
-
-
+    """,
+    unsafe_allow_html=True,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -80,6 +76,18 @@ BASE_WEIGHTS = {
 }
 
 DEFAULT_TICKERS = ["LULU", "REI", "SRPT", "CAG", "NVO", "PYPL", "VIXL", "NVDA"]
+
+# Anzeige-Spalten (wichtig: wird auch als Required-Cols verwendet)
+SHOW_COLS = [
+    "ticker","name","sleeve","weight","price","mktcap",
+    "forward_pe","trailing_pe","peg","ps","pb","fcf_yield",
+    "rev_cagr_3y","eps_cagr_3y","oper_margin","roe",
+    "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
+    "expected_growth","implied_growth","expectation_gap",
+    "tanaka_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
+]
+
+REQUIRED_COLS = set(SHOW_COLS + ["weight_dec"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UTIL
@@ -99,6 +107,92 @@ def safe_float(x):
     except Exception:
         return np.nan
 
+def sanitize_ticker(t: str) -> str:
+    t = (t or "").upper().strip()
+    return t if re.fullmatch(r"[A-Z0-9\.\-\^]{1,15}", t) else ""
+
+def z_to_01(x, xmin, xmax):
+    if np.isnan(x): return np.nan
+    if xmax == xmin: return 0.5
+    return float(np.clip((x - xmin) / (xmax - xmin), 0.0, 1.0))
+
+def inv_to_01(x, xmin, xmax):
+    v = z_to_01(x, xmin, xmax)
+    return np.nan if np.isnan(v) else 1.0 - v
+
+def nanmean(vals):
+    a = np.array(vals, dtype=float)
+    return np.nan if np.all(np.isnan(a)) else float(np.nanmean(a))
+
+def clean_forward_pe(x):
+    x = safe_float(x)
+    return np.nan if (np.isnan(x) or x <= 0) else x
+
+def _parse_tickers_any(text: str):
+    if not text:
+        return []
+    raw = text.replace("\n", " ").replace("\t", " ").replace(";", ",").replace("|", ",")
+    parts = []
+    for chunk in raw.split(","):
+        parts.extend(chunk.split())
+    tickers = [sanitize_ticker(p.strip()) for p in parts if p.strip()]
+    tickers = [t for t in tickers if t]
+    seen, out = set(), []
+    for t in tickers:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+def _read_tickers_from_csv(uploaded_file) -> list[str]:
+    raw = uploaded_file.read()
+    text = raw.decode("utf-8", errors="ignore")
+    sep = ";" if text.count(";") > text.count(",") else ","
+    df = pd.read_csv(io.StringIO(text), sep=sep)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    candidates = ["ticker", "symbol", "code", "codes", "ric"]
+    col = next((c for c in candidates if c in df.columns), None)
+    if col is None:
+        col = df.columns[0]
+
+    tickers = df[col].astype(str).str.upper().str.strip().tolist()
+    tickers = [sanitize_ticker(t) for t in tickers]
+    tickers = [t for t in tickers if t]
+    seen, out = set(), []
+    for t in tickers:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+def normalize_weights_pct(df):
+    w = df["weight"].apply(safe_float).fillna(0.0).values
+    s = float(np.sum(w))
+    if s <= 0:
+        df["weight"] = 0.0
+        return df
+    df["weight"] = (w / s) * 100.0
+    return df
+
+def sleeve_auto_heuristic(info: dict):
+    sector = (info.get("sector") or "").lower()
+    industry = (info.get("industry") or "").lower()
+    name = (info.get("shortName") or info.get("longName") or "").lower()
+    txt = " ".join([sector, industry, name])
+    if any(k in txt for k in ["biotech", "biotechnology", "pharmaceutical", "pharma", "drug", "therapeutics"]):
+        return "Biotech/Pharma"
+    if any(k in txt for k in ["semiconductor", "software", "internet", "computer", "technology", "cloud", "hardware", "ai"]):
+        return "Platform"
+    if any(k in txt for k in ["uranium", "mining", "metals", "materials", "oil", "gas", "energy", "coal"]):
+        return "Minerals/Energy"
+    if any(k in txt for k in ["bank", "financial", "insurance", "capital markets", "asset management"]):
+        return "Financials"
+    return "Other"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLAGS (Variante A) – Badges
+# ─────────────────────────────────────────────────────────────────────────────
 def classify_flags(row):
     out = []
     score = safe_float(row.get("tanaka_score", np.nan))
@@ -164,91 +258,17 @@ def render_flag_badges(flags):
             ">{label}</span>
             """
         )
-
     return "".join(parts)
 
-
-
-
-
-
-
-def z_to_01(x, xmin, xmax):
-    if np.isnan(x): return np.nan
-    if xmax == xmin: return 0.5
-    return float(np.clip((x - xmin) / (xmax - xmin), 0.0, 1.0))
-
-def inv_to_01(x, xmin, xmax):
-    v = z_to_01(x, xmin, xmax)
-    return np.nan if np.isnan(v) else 1.0 - v
-
-def nanmean(vals):
-    a = np.array(vals, dtype=float)
-    return np.nan if np.all(np.isnan(a)) else float(np.nanmean(a))
-
-def clean_forward_pe(x):
-    x = safe_float(x)
-    return np.nan if (np.isnan(x) or x <= 0) else x
-
-def _parse_tickers_any(text: str):
-    if not text:
-        return []
-    raw = text.replace("\n", " ").replace("\t", " ").replace(";", ",").replace("|", ",")
-    parts = []
-    for chunk in raw.split(","):
-        parts.extend(chunk.split())
-    tickers = [p.strip().upper() for p in parts if p.strip()]
-    seen, out = set(), []
-    for t in tickers:
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
-
-def _read_tickers_from_csv(uploaded_file) -> list[str]:
-    raw = uploaded_file.read()
-    text = raw.decode("utf-8", errors="ignore")
-    sep = ";" if text.count(";") > text.count(",") else ","
-    df = pd.read_csv(io.StringIO(text), sep=sep)
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    candidates = ["ticker", "symbol", "code", "codes", "ric"]
-    col = next((c for c in candidates if c in df.columns), None)
-    if col is None:
-        col = df.columns[0]
-
-    tickers = df[col].astype(str).str.upper().str.strip().tolist()
-    tickers = [t for t in tickers if t and t != "NAN"]
-    seen, out = set(), []
-    for t in tickers:
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
-    return out
-
-def normalize_weights_pct(df):
-    w = df["weight"].apply(safe_float).fillna(0.0).values
-    s = float(np.sum(w))
-    if s <= 0:
-        df["weight"] = 0.0
-        return df
-    df["weight"] = (w / s) * 100.0
+def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
+    for c in REQUIRED_COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+    # numeric coercion for critical cols
+    for c in ["weight", "tanaka_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
+        if c in df.columns:
+            df[c] = df[c].apply(safe_float)
     return df
-
-def sleeve_auto_heuristic(info: dict):
-    sector = (info.get("sector") or "").lower()
-    industry = (info.get("industry") or "").lower()
-    name = (info.get("shortName") or info.get("longName") or "").lower()
-    txt = " ".join([sector, industry, name])
-    if any(k in txt for k in ["biotech", "biotechnology", "pharmaceutical", "pharma", "drug", "therapeutics"]):
-        return "Biotech/Pharma"
-    if any(k in txt for k in ["semiconductor", "software", "internet", "computer", "technology", "cloud", "hardware", "ai"]):
-        return "Platform"
-    if any(k in txt for k in ["uranium", "mining", "metals", "materials", "oil", "gas", "energy", "coal"]):
-        return "Minerals/Energy"
-    if any(k in txt for k in ["bank", "financial", "insurance", "capital markets", "asset management"]):
-        return "Financials"
-    return "Other"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # YF fetch (cached)
@@ -454,7 +474,8 @@ def compute_total_score(row: pd.Series):
         if np.isnan(v): continue
         wsum += weights.get(k, 0.0) * v
         wtot += weights.get(k, 0.0)
-    if wtot <= 0: return np.nan, subs, exp_g, impl_g, gap_raw
+    if wtot <= 0:
+        return np.nan, subs, exp_g, impl_g, gap_raw
 
     total = wsum / wtot
     return float(np.clip(total, 0, 100)), subs, exp_g, impl_g, gap_raw
@@ -502,7 +523,7 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     return row
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR – exakt wie Screenshot-Flow
+# SIDEBAR – Screenshot-Flow
 # ─────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("CSV-Dateien")
 
@@ -518,7 +539,6 @@ st.sidebar.caption("")  # spacing
 shuffle = st.sidebar.checkbox("Zufällig mischen", value=False)
 max_n = st.sidebar.number_input("Max. Anzahl (0 = alle)", min_value=0, value=0, step=1)
 
-# Combine tickers
 tickers = []
 if uploaded is not None:
     try:
@@ -528,14 +548,12 @@ if uploaded is not None:
 
 tickers.extend(_parse_tickers_any(manual))
 
-# If none provided, use defaults (nice UX)
 if len(tickers) == 0:
     tickers = DEFAULT_TICKERS.copy()
 
-# dedupe keep order
 seen, combined = set(), []
 for t in tickers:
-    if t not in seen:
+    if t and t not in seen:
         combined.append(t)
         seen.add(t)
 
@@ -578,14 +596,14 @@ if len(selected) == 0:
     st.warning("Keine Ticker selektiert.")
     st.stop()
 
-# Initialize weights table session state (stable across reruns)
+# Initialize weights table session state
 if "weights_df" not in st.session_state:
     eq_w = 100.0 / len(selected)
     st.session_state["weights_df"] = pd.DataFrame(
         {"ticker": selected, "weight": [eq_w] * len(selected), "sleeve": [default_sleeve] * len(selected)}
     )
 
-# Sync tickers with selection (keep existing weights if possible)
+# Sync tickers with selection
 old = st.session_state["weights_df"].copy()
 old_map_w = dict(zip(old["ticker"], old["weight"]))
 old_map_s = dict(zip(old["ticker"], old["sleeve"]))
@@ -593,11 +611,7 @@ old_map_s = dict(zip(old["ticker"], old["sleeve"]))
 new_rows = []
 for t in selected:
     new_rows.append(
-        {
-            "ticker": t,
-            "weight": float(old_map_w.get(t, 100.0 / len(selected))),
-            "sleeve": old_map_s.get(t, default_sleeve),
-        }
+        {"ticker": t, "weight": float(old_map_w.get(t, 100.0 / len(selected))), "sleeve": old_map_s.get(t, default_sleeve)}
     )
 st.session_state["weights_df"] = pd.DataFrame(new_rows)
 
@@ -614,11 +628,11 @@ edited = st.data_editor(
     },
 )
 
-# Apply normalize and store back
 df_in = edited.copy()
 df_in["weight"] = df_in["weight"].apply(safe_float).fillna(0.0)
 df_in["sleeve"] = df_in["sleeve"].astype(str).str.strip()
 df_in.loc[~df_in["sleeve"].isin(SLEEVES), "sleeve"] = "Auto"
+df_in["ticker"] = df_in["ticker"].astype(str).apply(sanitize_ticker)
 df_in = df_in[df_in["ticker"].astype(str).str.strip() != ""].reset_index(drop=True)
 
 if auto_normalize:
@@ -626,7 +640,6 @@ if auto_normalize:
 
 st.session_state["weights_df"] = df_in
 
-# Run button: not strictly necessary (streamlit reruns anyway), but PM-feel
 if not run and "ran_once" not in st.session_state:
     st.info("Stell die Weights ein und klicke links auf **Load / Refresh**.")
     st.stop()
@@ -645,38 +658,46 @@ with st.spinner("Pulling Yahoo Finance fundamentals & computing scores …"):
         wt = float(safe_float(r["weight"]))
         sl = r.get("sleeve", "Auto")
         if not auto_fetch:
-            rows.append({"ticker": tkr, "weight": wt, "sleeve": sl})
+            # Minimal row; rest is filled by ensure_required_cols()
+            rows.append({"ticker": tkr, "weight": wt, "sleeve": sl, "name": ""})
         else:
             rows.append(build_row(tkr, sl, wt))
 
 df = pd.DataFrame(rows)
-df["weight_dec"] = df["weight"].apply(safe_float) / 100.0
-port_score = float(np.nansum(df["tanaka_score"] * df["weight_dec"])) if df["tanaka_score"].notna().any() else np.nan
+df = ensure_required_cols(df)
 
+df["weight_dec"] = df["weight"].apply(safe_float).fillna(0.0) / 100.0
+
+# Guard: wenn kein Score (z.B. auto_fetch aus), bleibt port_score NaN statt Crash
+if "tanaka_score" in df.columns and df["tanaka_score"].notna().any():
+    port_score = float(np.nansum(df["tanaka_score"] * df["weight_dec"]))
+else:
+    port_score = np.nan
+
+# Guard: leeres df
+if df.empty:
+    st.warning("Keine Datenpunkte – prüfe Ticker / CSV / Auswahl.")
+    st.stop()
+
+# Metrics
 m1, m2, m3, m4 = st.columns(4, gap="large")
 m1.metric("Portfolio Tanaka Score (wtd.)", f"{port_score:.1f}" if not np.isnan(port_score) else "—")
 m2.metric("Names", f"{len(df)}")
-top_sleeve = df.groupby("sleeve")["weight"].sum().sort_values(ascending=False).index[0]
+
+if df["sleeve"].notna().any():
+    top_sleeve = df.groupby("sleeve")["weight"].sum().sort_values(ascending=False).index[0]
+else:
+    top_sleeve = "—"
 m3.metric("Top Sleeve", top_sleeve)
-m4.metric("Coverage", f"{int(df['tanaka_score'].notna().sum())}/{len(df)}")
 
-show_cols = [
-    "ticker","name","sleeve","weight","price","mktcap",
-    "forward_pe","trailing_pe","peg","ps","pb","fcf_yield",
-    "rev_cagr_3y","eps_cagr_3y","oper_margin","roe",
-    "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
-    "expected_growth","implied_growth","expectation_gap",
-    "tanaka_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
-]
-for c in show_cols:
-    if c not in df.columns:
-        df[c] = np.nan
+m4.metric("Coverage", f"{int(df['tanaka_score'].notna().sum())}/{len(df)}" if "tanaka_score" in df.columns else f"0/{len(df)}")
 
-st.dataframe(df[show_cols].sort_values("weight", ascending=False), use_container_width=True, hide_index=True)
-st.download_button("Download KPI Table (CSV)", df[show_cols].to_csv(index=False).encode("utf-8"), "tanaka_scorecard.csv", "text/csv")
+# Table
+st.dataframe(df[SHOW_COLS].sort_values("weight", ascending=False), use_container_width=True, hide_index=True)
+st.download_button("Download KPI Table (CSV)", df[SHOW_COLS].to_csv(index=False).encode("utf-8"), "tanaka_scorecard.csv", "text/csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHARTS
+# CHARTS (guarded)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("3) Charts")
@@ -754,13 +775,20 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 st.subheader("5) Heatmap (0–100)")
 
-heat = df[["ticker","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap","tanaka_score"]].set_index("ticker")
-fig = px.imshow(heat.T, aspect="auto", title="Sub-scores and Total Score (0–100)")
-fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
-st.plotly_chart(fig, use_container_width=True)
+try:
+    heat = df[["ticker","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap","tanaka_score"]].set_index("ticker")
+    # Guard: wenn komplett NaN, dann keine Heatmap rendern
+    if heat.dropna(how="all").empty:
+        st.info("Heatmap: keine Subscore-Daten (z.B. auto_fetch aus oder Yahoo Coverage).")
+    else:
+        fig = px.imshow(heat.T, aspect="auto", title="Sub-scores and Total Score (0–100)")
+        fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+except Exception as e:
+    st.warning(f"Heatmap konnte nicht gerendert werden: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ACTION PANEL
+# ACTION PANEL (Badges)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("6) Action Panel (Tanaka-Style Flags)")
@@ -769,27 +797,18 @@ df_flags = df.copy()
 df_flags["flag_objects"] = df_flags.apply(classify_flags, axis=1)
 df_flags["flags_badges"] = df_flags["flag_objects"].apply(render_flag_badges)
 
-# Optional: sort so dass zuerst "Risiko" oder "Chancen" oben sind
-# z.B. nach Score absteigend
 df_flags = df_flags.sort_values("tanaka_score", ascending=False)
 
-# Wähle die Spalten, die du sehen willst
-view = df_flags[[
-    "ticker", "name", "sleeve", "weight", "tanaka_score",
-    "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
-    "flags_badges"
-]].copy()
+view = df_flags[
+    ["ticker", "name", "sleeve", "weight", "tanaka_score",
+     "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
+     "flags_badges"]
+].copy()
 
-# HTML Tabelle (weil st.dataframe kein HTML rendert)
 st.markdown(
-    view.to_html(
-        escape=False,
-        index=False,
-        justify="left"
-    ),
+    view.to_html(escape=False, index=False, justify="left"),
     unsafe_allow_html=True
 )
 
 st.caption("Hinweis: Grün = Chance, Rot = Risiko, Gelb = Prozess/Monitoring.")
-
 st.caption("Research dashboard (education). Not investment advice. Yahoo Finance coverage varies; missing values are normal.")
