@@ -930,28 +930,47 @@ else:
         for t in tickers_list:
             if t not in ret_all.columns:
                 continue
+        
             a = ret_all[t].dropna()
             b1 = ret_all[bench_sp].dropna() if bench_sp in ret_all.columns else pd.Series(dtype=float)
             b2 = ret_all[bench_dax].dropna() if bench_dax in ret_all.columns else pd.Series(dtype=float)
-
-            beta_sp, corr_sp = compute_beta_corr(a, b1) if not b1.empty else (np.nan, np.nan)
-            beta_dx, corr_dx = compute_beta_corr(a, b2) if not b2.empty else (np.nan, np.nan)
-
+        
+            if not b1.empty:
+                beta_sp, corr_sp, r2_sp, alpha_d_sp, alpha_a_sp = compute_regression_metrics(a, b1)
+                te_sp_i, ar_sp_i, ir_sp_i = tracking_error_and_ir(a, b1)
+            else:
+                beta_sp = corr_sp = r2_sp = alpha_d_sp = alpha_a_sp = np.nan
+                te_sp_i = ar_sp_i = ir_sp_i = np.nan
+        
+            if not b2.empty:
+                beta_dx, corr_dx, r2_dx, alpha_d_dx, alpha_a_dx = compute_regression_metrics(a, b2)
+                te_dx_i, ar_dx_i, ir_dx_i = tracking_error_and_ir(a, b2)
+            else:
+                beta_dx = corr_dx = r2_dx = alpha_d_dx = alpha_a_dx = np.nan
+                te_dx_i = ar_dx_i = ir_dx_i = np.nan
+        
             rows_b.append({
                 "ticker": t,
                 "weight_%": float(w_series.get(t, 0.0)),
+        
                 "beta_spx": beta_sp,
                 "corr_spx": corr_sp,
+                "r2_spx": r2_sp,
+                "alpha_pa_spx": alpha_a_sp,
+                "te_pa_spx": te_sp_i,
+                "ir_spx": ir_sp_i,
+        
                 "beta_dax": beta_dx,
                 "corr_dax": corr_dx,
-                "r2_spx": r2_sp,
-                "alpha_pa_spx": a_a_sp,
                 "r2_dax": r2_dx,
-                "alpha_pa_dax": a_a_dx,
+                "alpha_pa_dax": alpha_a_dx,
+                "te_pa_dax": te_dx_i,
+                "ir_dax": ir_dx_i,
             })
-
+        
         df_b = pd.DataFrame(rows_b).sort_values("weight_%", ascending=False)
         st.dataframe(df_b, use_container_width=True, hide_index=True)
+
 
         roll = tmp.copy()
         roll["corr_spx_roll"] = roll["PORT"].rolling(rolling_win).corr(roll["SPX"])
