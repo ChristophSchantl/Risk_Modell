@@ -587,4 +587,91 @@ fig = px.imshow(heat.T, aspect="auto", title="Sub-scores and Total Score (0–10
 fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
 st.plotly_chart(fig, use_container_width=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) ACTION PANEL: “Tanaka-style” watchlist flags
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("6) Action Panel (Tanaka-Style Flags)")
+
+# Flags aligned to Tanaka logic + our Expectation-Gap overlay:
+# - High conviction: very high score
+# - Trim-check: high score + high valuation (proxy for Target P/E discipline)
+# - Undervalued-growth: good score + low PEG (when available)
+# - Expectation-Gap: expected growth > implied growth by meaningful margin
+# - Risk flags: runway / leverage / extreme vol
+
+flags = []
+for _, r in df.iterrows():
+    fpe = safe_float(r.get("forward_pe", np.nan))
+    peg = safe_float(r.get("peg", np.nan))
+    score = safe_float(r.get("tanaka_score", np.nan))
+    vol = safe_float(r.get("vol_1y", np.nan))
+    runway = safe_float(r.get("cash_runway_months", np.nan))
+    nde = safe_float(r.get("net_debt_to_ebitda", np.nan))
+
+    exp_g = safe_float(r.get("expected_growth", np.nan))
+    impl_g = safe_float(r.get("implied_growth", np.nan))
+    gap = safe_float(r.get("expectation_gap", np.nan))
+
+    flag = []
+
+    # Conviction / discipline
+    if not np.isnan(score) and score >= 85:
+        flag.append("High Conviction")
+
+    # Trim / target multiple discipline
+    if not np.isnan(fpe) and fpe >= 45 and not np.isnan(score) and score >= 75:
+        flag.append("Trim-check (Target P/E?)")
+
+    # Undervalued growth proxy
+    if (not np.isnan(peg) and peg <= 1.2) and (not np.isnan(score) and score >= 70):
+        flag.append("Undervalued-growth candidate")
+
+    # Expectation-Gap flag (Tanaka-style)
+    # If expected growth exceeds implied by >5% absolute, it's a real "gap" (heuristic)
+    if not np.isnan(exp_g) and not np.isnan(impl_g):
+        if (exp_g - impl_g) >= 0.05:
+            flag.append("Expectation Gap (exp > implied)")
+
+    # If we have the raw gap proxy, use it as an additional signal
+    if not np.isnan(gap) and gap >= 0.10:
+        flag.append("Large Gap (>=10%)")
+
+    # Risk flags
+    if not np.isnan(vol) and vol >= 0.70:
+        flag.append("High vol")
+
+    if not np.isnan(runway) and runway <= 12:
+        flag.append("Runway risk (<12m)")
+
+    if not np.isnan(nde) and nde >= 4:
+        flag.append("Leverage risk (ND/EBITDA high)")
+
+    flags.append(", ".join(flag) if flag else "—")
+
+cols = [
+    "ticker", "name", "sleeve", "weight", "tanaka_score",
+    "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
+    "expected_growth", "implied_growth", "expectation_gap"
+]
+for c in cols:
+    if c not in df.columns:
+        df[c] = np.nan
+
+df_flags = df[cols].copy()
+df_flags["flags"] = flags
+
+st.dataframe(
+    df_flags.sort_values("tanaka_score", ascending=False),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.caption("Research/education dashboard. Not investment advice. Fundamentals coverage varies by yfinance; missing values are normal.")
+
+
+
+
+
+
 st.caption("Research/education dashboard. Fundamentals coverage varies by yfinance; missing values are normal.")
