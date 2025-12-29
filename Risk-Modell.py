@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # SHI Scorecard – Screenshot-Style Sidebar + Weights + Yahoo + Charts
 # + Beta/Correlation vs S&P 500 & DAX
-# + Action Panel mit farbigen Badges (HTML)
+# + Action Panel mit farbigen Badges (HTML
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
