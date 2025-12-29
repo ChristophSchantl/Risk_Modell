@@ -1,6 +1,6 @@
 # streamlit_app.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Tanaka-Style Scorecard – Screenshot-Style Sidebar + Weights + Yahoo + Charts
+# SHI Scorecard – Screenshot-Style Sidebar + Weights + Yahoo + Charts
 # + Beta/Correlation vs S&P 500 & DAX
 # + Action Panel mit farbigen Badges (HTML)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,7 +18,7 @@ import plotly.graph_objects as go
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG + CSS
 # ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Tanaka-Style Scorecard", page_icon="📈", layout="wide")
+st.set_page_config(page_title="SHI Scorecard", page_icon="📈", layout="wide")
 
 st.markdown(
     """
@@ -82,7 +82,7 @@ SHOW_COLS = [
     "rev_cagr_3y”","eps_cagr_3y","oper_margin","roe",
     "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
     "expected_growth","implied_growth","expectation_gap",
-    "tanaka_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
+    "shi_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
 ]
 
 # NOTE: Fix for accidental smart quote in rev_cagr_3y”" above:
@@ -196,7 +196,7 @@ def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
     # numeric coercion for key columns
-    for c in ["weight", "tanaka_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
+    for c in ["weight", "shi_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
         if c in df.columns:
             df[c] = df[c].apply(safe_float)
     return df
@@ -206,7 +206,7 @@ def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 def classify_flags(row):
     out = []
-    score = safe_float(row.get("tanaka_score", np.nan))
+    score = safe_float(row.get("shi_score", np.nan))
     fpe = safe_float(row.get("forward_pe", np.nan))
     peg = safe_float(row.get("peg", np.nan))
     vol = safe_float(row.get("vol_1y", np.nan))
@@ -507,7 +507,7 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     }
 
     total, subs, exp_g, impl_g, gap_raw = compute_total_score(pd.Series(row))
-    row["tanaka_score"] = total
+    row["shi_score"] = total
     row["expected_growth"] = exp_g
     row["implied_growth"] = impl_g
     row["expectation_gap"] = gap_raw
@@ -618,7 +618,7 @@ run = st.sidebar.button("Load / Refresh", type="primary")
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("📈 Tanaka-Style Scorecard")
+st.title("📈 SHI Scorecard")
 st.caption("Ticker rein → Gewicht setzen → Yahoo Pull → Score, Charts, Risk-Panel, Flags.")
 
 if len(selected) == 0:
@@ -678,7 +678,7 @@ st.session_state["ran_once"] = True
 # FETCH + SCORE
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.subheader("2) KPIs & Tanaka Score")
+st.subheader("2) KPIs & SHI Score")
 
 rows = []
 with st.spinner("Yahoo Finance Daten laden & Score berechnen …"):
@@ -695,15 +695,15 @@ df = ensure_required_cols(pd.DataFrame(rows))
 df["weight_dec"] = df["weight"].fillna(0.0) / 100.0
 
 port_score = np.nan
-if "tanaka_score" in df.columns and df["tanaka_score"].notna().any():
-    port_score = float(np.nansum(df["tanaka_score"] * df["weight_dec"]))
+if "shi_score" in df.columns and df["shi_score"].notna().any():
+    port_score = float(np.nansum(df["shi_score"] * df["weight_dec"]))
 
 if df.empty:
     st.warning("Keine Datenpunkte – prüfe Ticker-Auswahl.")
     st.stop()
 
 m1, m2, m3, m4 = st.columns(4, gap="large")
-m1.metric("Portfolio Tanaka Score (wtd.)", f"{port_score:.1f}" if not np.isnan(port_score) else "—")
+m1.metric("Portfolio SHI Score (wtd.)", f"{port_score:.1f}" if not np.isnan(port_score) else "—")
 m2.metric("Names", f"{len(df)}")
 
 top_sleeve = "—"
@@ -713,10 +713,10 @@ if df["sleeve"].notna().any():
         top_sleeve = gs.index[0]
 m3.metric("Top Sleeve", top_sleeve)
 
-m4.metric("Coverage", f"{int(df['tanaka_score'].notna().sum())}/{len(df)}" if "tanaka_score" in df.columns else f"0/{len(df)}")
+m4.metric("Coverage", f"{int(df['shi_score'].notna().sum())}/{len(df)}" if "shi_score" in df.columns else f"0/{len(df)}")
 
 st.dataframe(df[SHOW_COLS].sort_values("weight", ascending=False), use_container_width=True, hide_index=True)
-st.download_button("Download KPI Table (CSV)", df[SHOW_COLS].to_csv(index=False).encode("utf-8"), "tanaka_scorecard.csv", "text/csv")
+st.download_button("Download KPI Table (CSV)", df[SHOW_COLS].to_csv(index=False).encode("utf-8"), "shi_scorecard.csv", "text/csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CHARTS
@@ -734,12 +734,12 @@ with c1:
 
 with c2:
     d = df.copy()
-    d["wtd_contrib"] = d["tanaka_score"] * d["weight_dec"]
+    d["wtd_contrib"] = d["shi_score"] * d["weight_dec"]
     d = d.sort_values("wtd_contrib", ascending=False)
     fig = px.bar(
         d, x="wtd_contrib", y="ticker", orientation="h",
         title="Weighted Score Contribution (Score × Weight)",
-        hover_data=["name", "sleeve", "tanaka_score", "weight"],
+        hover_data=["name", "sleeve", "shi_score", "weight"],
     )
     fig.update_layout(margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
@@ -752,7 +752,7 @@ with c3:
     fig = px.scatter(
         scatter, x="forward_pe", y="growth_proxy",
         size="weight", color="sleeve", hover_name="ticker",
-        hover_data={"name": True, "tanaka_score": True, "weight": True, "forward_pe": True, "growth_proxy": True},
+        hover_data={"name": True, "shi_score": True, "weight": True, "forward_pe": True, "growth_proxy": True},
         title="Valuation vs Growth (proxy) — Undervalued Growth Map",
     )
     fig.update_yaxes(tickformat=".0%")
@@ -785,7 +785,7 @@ st.subheader("4) Expectation-Gap Overlay")
 fig = px.scatter(
     df, x="implied_growth", y="expected_growth",
     size="weight", color="sleeve", hover_name="ticker",
-    hover_data={"name": True, "tanaka_score": True, "expectation_gap": True},
+    hover_data={"name": True, "shi_score": True, "expectation_gap": True},
     title="Expected vs Implied Growth (Expectation-Gap Overlay)",
 )
 fig.add_shape(type="line", x0=0, y0=0, x1=0.30, y1=0.30, line=dict(dash="dash"))
@@ -797,7 +797,7 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 st.subheader("5) Heatmap (0–100)")
 
-heat_cols = ["ticker","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap","tanaka_score"]
+heat_cols = ["ticker","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap","shi_score"]
 heat = df[heat_cols].set_index("ticker")
 if heat.dropna(how="all").empty:
     st.info("Heatmap: keine Subscore-Daten (z.B. Yahoo Coverage / auto_fetch).")
@@ -897,7 +897,7 @@ else:
 # ACTION PANEL – HTML Badges (Grün/Rot/Gelb)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
-st.subheader("6) Action Panel (Tanaka-Style Flags)")
+st.subheader("6) Action Panel (SHI Flags)")
 
 df_flags = df.copy()
 df_flags["flag_objects"] = df_flags.apply(classify_flags, axis=1)
@@ -906,10 +906,10 @@ df_flags["flags_badges"] = df_flags["flag_objects"].apply(render_flag_badges)
 # DEBUG (optional): zeigt ob HTML wirklich in der Spalte steckt
 # st.write("DEBUG flags_badges sample:", df_flags["flags_badges"].iloc[0])
 
-df_flags = df_flags.sort_values("tanaka_score", ascending=False)
+df_flags = df_flags.sort_values("shi_score", ascending=False)
 
 view = df_flags[
-    ["ticker", "name", "sleeve", "weight", "tanaka_score",
+    ["ticker", "name", "sleeve", "weight", "shi_score",
      "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
      "flags_badges"]
 ].copy()
