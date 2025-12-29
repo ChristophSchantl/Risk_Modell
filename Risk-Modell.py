@@ -78,7 +78,7 @@ DEFAULT_TICKERS = ["LULU", "REI", "SRPT", "CAG", "NVO", "PYPL", "VIXL", "NVDA"]
 
 SHOW_COLS = [
     "ticker","name","sleeve","weight","price","mktcap",
-    "forward_pe","trailing_pe","peg","ps","pb","fcf_yield",
+    "forward_pe","trailing_pe","pegratio","ps","pb","fcf_yield",
     "rev_cagr_3y”","eps_cagr_3y","oper_margin","roe",
     "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
     "expected_growth","implied_growth","expectation_gap",
@@ -196,7 +196,7 @@ def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
     # numeric coercion for key columns
-    for c in ["weight", "tanaka_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
+    for c in ["weight", "tanaka_score", "forward_pe", "pegratio", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
         if c in df.columns:
             df[c] = df[c].apply(safe_float)
     return df
@@ -208,7 +208,7 @@ def classify_flags(row):
     out = []
     score = safe_float(row.get("tanaka_score", np.nan))
     fpe = safe_float(row.get("forward_pe", np.nan))
-    peg = safe_float(row.get("peg", np.nan))
+    pegratio = safe_float(row.get("pegratio", np.nan))
     vol = safe_float(row.get("vol_1y", np.nan))
     runway = safe_float(row.get("cash_runway_months", np.nan))
     nde = safe_float(row.get("net_debt_to_ebitda", np.nan))
@@ -219,7 +219,7 @@ def classify_flags(row):
     # Positive
     if not np.isnan(score) and score >= 85:
         out.append(("High Conviction", "positive"))
-    if (not np.isnan(peg) and peg <= 1.2) and (not np.isnan(score) and score >= 70):
+    if (not np.isnan(pegratio) and pegratio <= 1.2) and (not np.isnan(score) and score >= 70):
         out.append(("Undervalued-growth candidate", "positive"))
     if not np.isnan(exp_g) and not np.isnan(impl_g) and (exp_g - impl_g) >= 0.05:
         out.append(("Expectation Gap (exp > implied)", "positive"))
@@ -374,7 +374,7 @@ def score_quality(vals):
 def score_valuation(vals):
     s = nanmean([inv_to_01(vals.get("forward_pe", np.nan), 5, 60),
                  inv_to_01(vals.get("trailing_pe", np.nan), 5, 60),
-                 inv_to_01(vals.get("peg", np.nan), 0.5, 3.0),
+                 inv_to_01(vals.get("pegratio", np.nan), 0.5, 3.0),
                  z_to_01(vals.get("fcf_yield", np.nan), -0.02, 0.08)])
     return np.nan if np.isnan(s) else float(np.clip(s * 100, 0, 100))
 
@@ -435,7 +435,7 @@ def compute_total_score(row: pd.Series):
         "oper_margin": row.get("oper_margin", np.nan),
         "forward_pe": row.get("forward_pe", np.nan),
         "trailing_pe": row.get("trailing_pe", np.nan),
-        "peg": row.get("peg", np.nan),
+        "pegratio": row.get("pegratio", np.nan),
         "fcf_yield": row.get("fcf_yield", np.nan),
         "mom_6m": row.get("mom_6m", np.nan),
         "vol_1y": row.get("vol_1y", np.nan),
@@ -492,7 +492,7 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
         "mktcap": safe_float(info.get("marketCap")),
         "trailing_pe": safe_float(info.get("trailingPE")),
         "forward_pe": clean_forward_pe(info.get("forwardPE")),
-        "peg": safe_float(info.get("pegRatio")),
+        "pegratio": safe_float(info.get("pegratioRatio")),
         "ps": safe_float(info.get("priceToSalesTrailing12Months")),
         "pb": safe_float(info.get("priceToBook")),
         "roe": safe_float(info.get("returnOnEquity")),
@@ -910,7 +910,7 @@ df_flags = df_flags.sort_values("tanaka_score", ascending=False)
 
 view = df_flags[
     ["ticker", "name", "sleeve", "weight", "tanaka_score",
-     "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
+     "forward_pe", "pegratio", "vol_1y", "cash_runway_months", "net_debt_to_ebitda",
      "flags_badges"]
 ].copy()
 
