@@ -2,7 +2,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # SHI Scorecard – Screenshot-Style Sidebar + Weights + Yahoo + Charts
 # + Beta/Correlation vs S&P 500 & DAX
-# + Action Panel mit farbigen Badges (HTML
+# + Action Panel mit farbigen Badges (HTML)
+#
+# UPDATE (Fallback-Engine):
+# - Wenn Yahoo/yfinance Felder fehlen (None/NaN), werden zentrale KPIs robust
+#   aus Income/CF/Balance Sheet approximiert:
+#     * trailing_pe, ps, pb, fcf_yield, oper_margin, roe, net_debt_to_ebitda
+# - forward_pe / peg bleiben i.d.R. estimate-abhängig (ohne Analysten-Coverage
+#   nicht sauber berechenbar). forward_pe wird NICHT “erfunden”.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
@@ -79,14 +86,11 @@ DEFAULT_TICKERS = ["LULU", "REI", "SRPT", "CAG", "NVO", "PYPL", "VIXL", "NVDA"]
 SHOW_COLS = [
     "ticker","name","sleeve","weight","price","mktcap",
     "forward_pe","trailing_pe","peg","ps","pb","fcf_yield",
-    "rev_cagr_3y”","eps_cagr_3y","oper_margin","roe",
+    "rev_cagr_3y","eps_cagr_3y","oper_margin","roe",
     "mom_6m","vol_1y","net_debt_to_ebitda","cash_runway_months",
     "expected_growth","implied_growth","expectation_gap",
     "shi_score","score_growth","score_quality","score_valuation","score_momentum","score_convexity","score_risk","score_gap"
 ]
-
-# NOTE: Fix for accidental smart quote in rev_cagr_3y”" above:
-SHOW_COLS = [c.replace("”", "").replace("“", "") for c in SHOW_COLS]
 
 REQUIRED_COLS = set(SHOW_COLS + ["weight_dec"])
 
@@ -195,14 +199,14 @@ def ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
     for c in REQUIRED_COLS:
         if c not in df.columns:
             df[c] = np.nan
-    # numeric coercion for key columns
-    for c in ["weight", "shi_score", "forward_pe", "peg", "vol_1y", "cash_runway_months", "net_debt_to_ebitda"]:
+    for c in ["weight", "shi_score", "forward_pe", "trailing_pe", "peg", "ps", "pb", "vol_1y",
+              "cash_runway_months", "net_debt_to_ebitda", "oper_margin", "roe", "fcf_yield", "mktcap", "price"]:
         if c in df.columns:
             df[c] = df[c].apply(safe_float)
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FLAGS – Variante A: Klassifikation + HTML Badges
+# FLAGS – Klassifikation + HTML Badges
 # ─────────────────────────────────────────────────────────────────────────────
 def classify_flags(row):
     out = []
@@ -241,10 +245,8 @@ def classify_flags(row):
     return out
 
 def render_flag_badges(flags):
-    # IMPORTANT: MUST return HTML <span> badges, not newlines
     if not flags:
         return "—"
-
     parts = []
     for label, kind in flags:
         if kind == "positive":
@@ -253,7 +255,6 @@ def render_flag_badges(flags):
             color, bg = "#991b1b", "#fee2e2"   # red
         else:
             color, bg = "#92400e", "#fef3c7"   # amber
-
         parts.append(
             f'<span style="background:{bg};color:{color};padding:4px 10px;'
             f'border-radius:12px;font-size:0.75rem;font-weight:650;'
@@ -285,6 +286,7 @@ def fetch_hist(ticker: str, period="2y"):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_financials(ticker: str):
     t = yf.Ticker(ticker)
+    # yfinance liefert i.d.R. annual statements (letzte 4 Jahre)
     try:
         inc = t.income_stmt if t.income_stmt is not None else pd.DataFrame()
     except Exception:
@@ -299,6 +301,50 @@ def fetch_financials(ticker: str):
         bs = pd.DataFrame()
     return inc, cf, bs
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STATEMENT HELPERS (robust row lookup)
+# ─────────────────────────────────────────────────────────────────────────────
+def _norm_idx(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+def _find_row(df: pd.DataFrame, candidates: list[str]):
+    if df is None or df.empty:
+        return None
+    # map normalized index -> original index
+    idx_map = { _norm_idx(str(ix)): ix for ix in df.index }
+    for cand in candidates:
+        key = _norm_idx(cand)
+        if key in idx_map:
+            return idx_map[key]
+    # fallback: contains match
+    keys = list(idx_map.keys())
+    for cand in candidates:
+        key = _norm_idx(cand)
+        for k in keys:
+            if key and (key in k or k in key):
+                return idx_map[k]
+    return None
+
+def _latest_value(df: pd.DataFrame, row_name):
+    try:
+        if df is None or df.empty or row_name is None:
+            return np.nan
+        s = df.loc[row_name].dropna()
+        if s is None or len(s) == 0:
+            return np.nan
+        # yfinance stellt häufig Spalten als Datums-Objekte bereit; "iloc[0]" ist i.d.R. das jüngste Jahr
+        return safe_float(s.iloc[0])
+    except Exception:
+        return np.nan
+
+def _latest_positive(df: pd.DataFrame, row_candidates: list[str]):
+    row = _find_row(df, row_candidates)
+    v = _latest_value(df, row)
+    return v
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKET HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 def calc_mom_vol(hist: pd.DataFrame):
     if hist is None or hist.empty or "Close" not in hist.columns:
         return np.nan, np.nan
@@ -311,25 +357,22 @@ def calc_mom_vol(hist: pd.DataFrame):
     vol = float(np.std(r) * np.sqrt(252)) if len(r) >= 60 else np.nan
     return float(mom), vol
 
-def fcf_yield(info):
-    fcf = safe_float(info.get("freeCashflow"))
-    mcap = safe_float(info.get("marketCap"))
-    if np.isnan(fcf) or np.isnan(mcap) or mcap <= 0:
-        return np.nan
-    return fcf / mcap
-
 def cash_runway_months(bs: pd.DataFrame, cf: pd.DataFrame):
     try:
         cash = np.nan
         if isinstance(bs, pd.DataFrame) and not bs.empty:
-            for cand in ["Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash"]:
-                if cand in bs.index:
-                    cash = safe_float(bs.loc[cand].iloc[0]); break
+            cash = _latest_positive(bs, [
+                "Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash", "Cash Cash Equivalents And Short Term Investments",
+                "CashAndCashEquivalentsAndShortTermInvestments"
+            ])
+
         ocf = np.nan
         if isinstance(cf, pd.DataFrame) and not cf.empty:
-            for cand in ["Total Cash From Operating Activities", "Operating Cash Flow", "OperatingCashFlow"]:
-                if cand in cf.index:
-                    ocf = safe_float(cf.loc[cand].iloc[0]); break
+            ocf = _latest_positive(cf, [
+                "Total Cash From Operating Activities", "Operating Cash Flow", "OperatingCashFlow",
+                "Net Cash Provided By Operating Activities", "NetCashProvidedByOperatingActivities"
+            ])
+
         if not np.isnan(cash) and not np.isnan(ocf) and ocf < 0:
             return (cash / abs(ocf)) * 12.0
     except Exception:
@@ -340,10 +383,7 @@ def try_cagr_from_income_stmt(inc: pd.DataFrame, row_name_candidates, years=4):
     try:
         if inc is None or inc.empty:
             return np.nan
-        row = None
-        for cand in row_name_candidates:
-            if cand in inc.index:
-                row = cand; break
+        row = _find_row(inc, list(row_name_candidates))
         if row is None:
             return np.nan
         s = inc.loc[row].dropna().astype(float)
@@ -357,6 +397,115 @@ def try_cagr_from_income_stmt(inc: pd.DataFrame, row_name_candidates, years=4):
         return (end / start) ** (1 / (n - 1)) - 1
     except Exception:
         return np.nan
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FALLBACK KPI ENGINE (aus Statements)
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_kpi_fallbacks(info: dict, inc: pd.DataFrame, cf: pd.DataFrame, bs: pd.DataFrame, price: float, mcap: float):
+    """
+    Liefert KPI-Fallbacks, wenn Yahoo Felder fehlen.
+    Wichtig:
+      - Statements sind i.d.R. annual -> als "TTM-proxy" (letztes FY) interpretieren.
+      - forward_pe / peg sind estimates -> werden nicht künstlich geschätzt.
+    """
+    out = {}
+
+    price = safe_float(price)
+    mcap = safe_float(mcap)
+
+    # Shares (proxy)
+    shares = safe_float(info.get("sharesOutstanding"))
+    if np.isnan(shares) and (not np.isnan(mcap)) and (not np.isnan(price)) and price > 0:
+        shares = mcap / price
+
+    # Income statement proxies
+    revenue = _latest_positive(inc, ["Total Revenue", "TotalRevenue", "Revenue"])
+    op_income = _latest_positive(inc, ["Operating Income", "OperatingIncome"])
+    net_income = _latest_positive(inc, ["Net Income", "NetIncome", "Net Income Common Stockholders", "NetIncomeCommonStockholders"])
+
+    ebitda = _latest_positive(inc, ["EBITDA", "Ebitda"])  # nicht immer vorhanden
+
+    # Cashflow proxies
+    ocf = _latest_positive(cf, [
+        "Total Cash From Operating Activities", "Operating Cash Flow", "OperatingCashFlow",
+        "Net Cash Provided By Operating Activities", "NetCashProvidedByOperatingActivities"
+    ])
+    capex = _latest_positive(cf, ["Capital Expenditures", "CapitalExpenditures"])
+    # capex ist häufig negativ; FCF = OCF - capex (bei capex negativ => plus)
+    fcf = np.nan
+    if not np.isnan(ocf) and not np.isnan(capex):
+        fcf = ocf - capex
+
+    # Balance sheet proxies
+    cash = _latest_positive(bs, [
+        "Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash",
+        "Cash Cash Equivalents And Short Term Investments", "CashAndCashEquivalentsAndShortTermInvestments"
+    ])
+    total_debt = _latest_positive(bs, [
+        "Total Debt", "TotalDebt",
+        "Long Term Debt", "LongTermDebt",
+        "Long Term Debt And Capital Lease Obligation", "LongTermDebtAndCapitalLeaseObligation"
+    ])
+    # Falls "Total Debt" fehlt, versuche Summe aus LT + ST
+    if np.isnan(total_debt):
+        lt = _latest_positive(bs, ["Long Term Debt", "LongTermDebt"])
+        st = _latest_positive(bs, ["Short Long Term Debt", "ShortLongTermDebt", "Short Term Debt", "ShortTermDebt"])
+        if not np.isnan(lt) or not np.isnan(st):
+            total_debt = (0.0 if np.isnan(lt) else lt) + (0.0 if np.isnan(st) else st)
+
+    equity = _latest_positive(bs, [
+        "Total Stockholder Equity", "TotalStockholderEquity",
+        "Stockholders Equity", "StockholdersEquity",
+        "Total Equity Gross Minority Interest", "TotalEquityGrossMinorityInterest"
+    ])
+
+    # --- trailing P/E (proxy: Net income / shares)
+    trailing_pe_fb = np.nan
+    if not np.isnan(price) and price > 0 and not np.isnan(net_income) and not np.isnan(shares) and shares > 0:
+        eps = net_income / shares
+        if eps > 0:
+            trailing_pe_fb = price / eps
+    out["trailing_pe_fb"] = trailing_pe_fb
+
+    # --- P/S (mcap / revenue)
+    ps_fb = np.nan
+    if not np.isnan(mcap) and mcap > 0 and not np.isnan(revenue) and revenue > 0:
+        ps_fb = mcap / revenue
+    out["ps_fb"] = ps_fb
+
+    # --- P/B (mcap / equity)
+    pb_fb = np.nan
+    if not np.isnan(mcap) and mcap > 0 and not np.isnan(equity) and equity > 0:
+        pb_fb = mcap / equity
+    out["pb_fb"] = pb_fb
+
+    # --- FCF Yield (fcf / mcap)
+    fcf_yield_fb = np.nan
+    if not np.isnan(fcf) and not np.isnan(mcap) and mcap > 0:
+        fcf_yield_fb = fcf / mcap
+    out["fcf_yield_fb"] = fcf_yield_fb
+
+    # --- Operating margin (op_income / revenue)
+    oper_margin_fb = np.nan
+    if not np.isnan(op_income) and not np.isnan(revenue) and revenue != 0:
+        oper_margin_fb = op_income / revenue
+    out["oper_margin_fb"] = oper_margin_fb
+
+    # --- ROE (net_income / equity)
+    roe_fb = np.nan
+    if not np.isnan(net_income) and not np.isnan(equity) and equity != 0:
+        roe_fb = net_income / equity
+    out["roe_fb"] = roe_fb
+
+    # --- Net debt / EBITDA
+    nde_fb = np.nan
+    if not np.isnan(total_debt) or not np.isnan(cash):
+        net_debt = (0.0 if np.isnan(total_debt) else total_debt) - (0.0 if np.isnan(cash) else cash)
+        if not np.isnan(ebitda) and ebitda != 0:
+            nde_fb = net_debt / ebitda
+    out["net_debt_to_ebitda_fb"] = nde_fb
+
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SCORING
@@ -417,10 +566,13 @@ def score_expectation_gap(vals):
     rev = vals.get("rev_cagr_3y", np.nan)
     mom = vals.get("mom_6m", np.nan)
     expected = nanmean([eps, rev])
+
     fpe = vals.get("forward_pe", np.nan)
     implied = (1.0 / fpe) if (not np.isnan(fpe) and fpe > 0) else 0.0
+
     mom_tilt = 0.25 * mom if not np.isnan(mom) else 0.0
     gap = (expected if not np.isnan(expected) else 0.0) - implied + mom_tilt
+
     s = z_to_01(gap, -0.10, 0.30)
     return float(np.clip(s * 100, 0, 100)), expected, implied, gap
 
@@ -463,7 +615,7 @@ def compute_total_score(row: pd.Series):
 
     wsum, wtot = 0.0, 0.0
     for k, v in subs.items():
-        if np.isnan(v): 
+        if np.isnan(v):
             continue
         wsum += weights.get(k, 0.0) * v
         wtot += weights.get(k, 0.0)
@@ -473,6 +625,9 @@ def compute_total_score(row: pd.Series):
     total = wsum / wtot
     return float(np.clip(total, 0, 100)), subs, exp_g, impl_g, gap_raw
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD ROW (Yahoo + Fallbacks)
+# ─────────────────────────────────────────────────────────────────────────────
 def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     info = fetch_info(ticker)
     hist = fetch_hist(ticker, "2y")
@@ -483,24 +638,74 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     if sleeve == "Auto":
         sleeve = sleeve_auto_heuristic(info)
 
+    price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    mktcap = safe_float(info.get("marketCap"))
+
+    # Raw Yahoo fields
+    trailing_pe = safe_float(info.get("trailingPE"))
+    forward_pe = clean_forward_pe(info.get("forwardPE"))
+    peg = safe_float(info.get("pegRatio"))
+
+    ps = safe_float(info.get("priceToSalesTrailing12Months"))
+    pb = safe_float(info.get("priceToBook"))
+    roe = safe_float(info.get("returnOnEquity"))
+    oper_margin = safe_float(info.get("operatingMargins"))
+    nde = safe_float(info.get("netDebtToEBITDA"))
+
+    # FCF yield via Yahoo direct
+    fcf = safe_float(info.get("freeCashflow"))
+    fcf_y = np.nan
+    if not np.isnan(fcf) and not np.isnan(mktcap) and mktcap > 0:
+        fcf_y = fcf / mktcap
+
+    # Fallbacks aus Statements (nur wenn Yahoo missing/NaN)
+    fb = compute_kpi_fallbacks(info, inc, cf, bs, price=price, mcap=mktcap)
+
+    if np.isnan(trailing_pe):
+        trailing_pe = fb.get("trailing_pe_fb", np.nan)
+
+    if np.isnan(ps):
+        ps = fb.get("ps_fb", np.nan)
+
+    if np.isnan(pb):
+        pb = fb.get("pb_fb", np.nan)
+
+    if np.isnan(fcf_y):
+        fcf_y = fb.get("fcf_yield_fb", np.nan)
+
+    if np.isnan(oper_margin):
+        oper_margin = fb.get("oper_margin_fb", np.nan)
+
+    if np.isnan(roe):
+        roe = fb.get("roe_fb", np.nan)
+
+    if np.isnan(nde):
+        nde = fb.get("net_debt_to_ebitda_fb", np.nan)
+
     row = {
         "ticker": ticker.upper().strip(),
         "name": (info.get("shortName") or info.get("longName") or ""),
         "sleeve": sleeve,
         "weight": float(weight_pct),
-        "price": safe_float(info.get("currentPrice") or info.get("regularMarketPrice")),
-        "mktcap": safe_float(info.get("marketCap")),
-        "trailing_pe": safe_float(info.get("trailingPE")),
-        "forward_pe": clean_forward_pe(info.get("forwardPE")),
-        "peg": safe_float(info.get("pegRatio")),
-        "ps": safe_float(info.get("priceToSalesTrailing12Months")),
-        "pb": safe_float(info.get("priceToBook")),
-        "roe": safe_float(info.get("returnOnEquity")),
-        "oper_margin": safe_float(info.get("operatingMargins")),
-        "net_debt_to_ebitda": safe_float(info.get("netDebtToEBITDA")),
-        "fcf_yield": fcf_yield(info),
-        "rev_cagr_3y": try_cagr_from_income_stmt(inc, ["Total Revenue", "TotalRevenue", "Total revenue"], years=4),
+
+        "price": price,
+        "mktcap": mktcap,
+
+        "trailing_pe": trailing_pe,
+        "forward_pe": forward_pe,   # bleibt estimate-abhängig
+        "peg": peg,                 # bleibt estimate-abhängig
+
+        "ps": ps,
+        "pb": pb,
+        "roe": roe,
+        "oper_margin": oper_margin,
+        "net_debt_to_ebitda": nde,
+
+        "fcf_yield": fcf_y,
+
+        "rev_cagr_3y": try_cagr_from_income_stmt(inc, ["Total Revenue", "TotalRevenue", "Revenue"], years=4),
         "eps_cagr_3y": try_cagr_from_income_stmt(inc, ["Diluted EPS", "Basic EPS", "DilutedEPS", "BasicEPS"], years=4),
+
         "cash_runway_months": cash_runway_months(bs, cf),
         "mom_6m": mom,
         "vol_1y": vol,
@@ -513,6 +718,7 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     row["expectation_gap"] = gap_raw
     for k, v in subs.items():
         row[f"score_{k}"] = v
+
     return row
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,13 +731,11 @@ def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
         return pd.DataFrame()
 
     if isinstance(data.columns, pd.MultiIndex):
-        # Prefer Close
         if "Close" in data.columns.get_level_values(0):
             px_ = data["Close"].copy()
         else:
             px_ = data.xs(data.columns.levels[0][0], axis=1, level=0).copy()
     else:
-        # single ticker
         if "Close" in data.columns:
             px_ = data[["Close"]].copy()
             px_.columns = [tickers[0]]
@@ -902,10 +1106,6 @@ st.subheader("6) Action Panel (SHI Flags)")
 df_flags = df.copy()
 df_flags["flag_objects"] = df_flags.apply(classify_flags, axis=1)
 df_flags["flags_badges"] = df_flags["flag_objects"].apply(render_flag_badges)
-
-# DEBUG (optional): zeigt ob HTML wirklich in der Spalte steckt
-# st.write("DEBUG flags_badges sample:", df_flags["flags_badges"].iloc[0])
-
 df_flags = df_flags.sort_values("shi_score", ascending=False)
 
 view = df_flags[
@@ -914,7 +1114,6 @@ view = df_flags[
      "flags_badges"]
 ].copy()
 
-# WICHTIG: Hier bewusst HTML-Render statt st.dataframe, sonst keine Farben
 st.markdown(view.to_html(escape=False, index=False), unsafe_allow_html=True)
 
 st.caption("Hinweis: Grün = Chance, Rot = Risiko, Gelb = Prozess/Monitoring.")
