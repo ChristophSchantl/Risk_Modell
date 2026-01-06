@@ -4,17 +4,16 @@
 # + Beta/Correlation vs S&P 500 & DAX
 # + Action Panel mit farbigen Badges (HTML)
 #
-# UPDATE (Fallback-Engine):
-# - Wenn Yahoo/yfinance Felder fehlen (None/NaN), werden zentrale KPIs robust
-#   aus Income/CF/Balance Sheet approximiert:
-#     * trailing_pe, ps, pb, fcf_yield, oper_margin, roe, net_debt_to_ebitda
-# - forward_pe / peg bleiben i.d.R. estimate-abhängig (ohne Analysten-Coverage
-#   nicht sauber berechenbar). forward_pe wird NICHT “erfunden”.
+# FULL VERSION (robust fundamentals):
+# - Preis-Fallback: history() + fast_info
+# - MarketCap-Fallback: fast_info + sharesOutstanding*price
+# - KPI-Fallbacks aus Statements (Income/CF/BS): trailing PE, P/S, P/B, FCF Yield,
+#   Operating Margin, ROE, NetDebt/EBITDA (wenn EBITDA verfügbar)
+# - Cache-Buster via refresh_token (Load/Refresh erzwingt neue Calls)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import io
 import re
-from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -250,11 +249,11 @@ def render_flag_badges(flags):
     parts = []
     for label, kind in flags:
         if kind == "positive":
-            color, bg = "#166534", "#dcfce7"   # green
+            color, bg = "#166534", "#dcfce7"
         elif kind == "negative":
-            color, bg = "#991b1b", "#fee2e2"   # red
+            color, bg = "#991b1b", "#fee2e2"
         else:
-            color, bg = "#92400e", "#fef3c7"   # amber
+            color, bg = "#92400e", "#fef3c7"
         parts.append(
             f'<span style="background:{bg};color:{color};padding:4px 10px;'
             f'border-radius:12px;font-size:0.75rem;font-weight:650;'
@@ -264,18 +263,39 @@ def render_flag_badges(flags):
     return "".join(parts)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YF FETCH (cached)
+# CACHE BUSTER (Load/Refresh)
+# ─────────────────────────────────────────────────────────────────────────────
+if "refresh_token" not in st.session_state:
+    st.session_state["refresh_token"] = 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YF FETCH (cached) – accepts refresh_token
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_info(ticker: str):
+def fetch_info(ticker: str, refresh_token: int = 0):
     t = yf.Ticker(ticker)
+    info = {}
+
+    # fast_info first (often more stable)
     try:
-        return t.get_info() or {}
+        fi = getattr(t, "fast_info", None)
+        if fi:
+            info["_fast_info"] = dict(fi)
     except Exception:
-        return {}
+        pass
+
+    # get_info next
+    try:
+        gi = t.get_info()
+        if gi:
+            info.update(gi)
+    except Exception:
+        pass
+
+    return info or {}
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_hist(ticker: str, period="2y"):
+def fetch_hist(ticker: str, period="2y", refresh_token: int = 0):
     t = yf.Ticker(ticker)
     try:
         h = t.history(period=period, auto_adjust=True)
@@ -284,9 +304,8 @@ def fetch_hist(ticker: str, period="2y"):
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_financials(ticker: str):
+def fetch_financials(ticker: str, refresh_token: int = 0):
     t = yf.Ticker(ticker)
-    # yfinance liefert i.d.R. annual statements (letzte 4 Jahre)
     try:
         inc = t.income_stmt if t.income_stmt is not None else pd.DataFrame()
     except Exception:
@@ -310,13 +329,11 @@ def _norm_idx(s: str) -> str:
 def _find_row(df: pd.DataFrame, candidates: list[str]):
     if df is None or df.empty:
         return None
-    # map normalized index -> original index
-    idx_map = { _norm_idx(str(ix)): ix for ix in df.index }
+    idx_map = {_norm_idx(str(ix)): ix for ix in df.index}
     for cand in candidates:
         key = _norm_idx(cand)
         if key in idx_map:
             return idx_map[key]
-    # fallback: contains match
     keys = list(idx_map.keys())
     for cand in candidates:
         key = _norm_idx(cand)
@@ -332,15 +349,13 @@ def _latest_value(df: pd.DataFrame, row_name):
         s = df.loc[row_name].dropna()
         if s is None or len(s) == 0:
             return np.nan
-        # yfinance stellt häufig Spalten als Datums-Objekte bereit; "iloc[0]" ist i.d.R. das jüngste Jahr
         return safe_float(s.iloc[0])
     except Exception:
         return np.nan
 
 def _latest_positive(df: pd.DataFrame, row_candidates: list[str]):
     row = _find_row(df, row_candidates)
-    v = _latest_value(df, row)
-    return v
+    return _latest_value(df, row)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MARKET HELPERS
@@ -362,7 +377,8 @@ def cash_runway_months(bs: pd.DataFrame, cf: pd.DataFrame):
         cash = np.nan
         if isinstance(bs, pd.DataFrame) and not bs.empty:
             cash = _latest_positive(bs, [
-                "Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash", "Cash Cash Equivalents And Short Term Investments",
+                "Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash",
+                "Cash Cash Equivalents And Short Term Investments",
                 "CashAndCashEquivalentsAndShortTermInvestments"
             ])
 
@@ -402,56 +418,45 @@ def try_cagr_from_income_stmt(inc: pd.DataFrame, row_name_candidates, years=4):
 # FALLBACK KPI ENGINE (aus Statements)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_kpi_fallbacks(info: dict, inc: pd.DataFrame, cf: pd.DataFrame, bs: pd.DataFrame, price: float, mcap: float):
-    """
-    Liefert KPI-Fallbacks, wenn Yahoo Felder fehlen.
-    Wichtig:
-      - Statements sind i.d.R. annual -> als "TTM-proxy" (letztes FY) interpretieren.
-      - forward_pe / peg sind estimates -> werden nicht künstlich geschätzt.
-    """
     out = {}
-
     price = safe_float(price)
     mcap = safe_float(mcap)
 
-    # Shares (proxy)
     shares = safe_float(info.get("sharesOutstanding"))
     if np.isnan(shares) and (not np.isnan(mcap)) and (not np.isnan(price)) and price > 0:
         shares = mcap / price
 
-    # Income statement proxies
     revenue = _latest_positive(inc, ["Total Revenue", "TotalRevenue", "Revenue"])
     op_income = _latest_positive(inc, ["Operating Income", "OperatingIncome"])
     net_income = _latest_positive(inc, ["Net Income", "NetIncome", "Net Income Common Stockholders", "NetIncomeCommonStockholders"])
+    ebitda = _latest_positive(inc, ["EBITDA", "Ebitda"])
 
-    ebitda = _latest_positive(inc, ["EBITDA", "Ebitda"])  # nicht immer vorhanden
-
-    # Cashflow proxies
     ocf = _latest_positive(cf, [
         "Total Cash From Operating Activities", "Operating Cash Flow", "OperatingCashFlow",
         "Net Cash Provided By Operating Activities", "NetCashProvidedByOperatingActivities"
     ])
     capex = _latest_positive(cf, ["Capital Expenditures", "CapitalExpenditures"])
-    # capex ist häufig negativ; FCF = OCF - capex (bei capex negativ => plus)
+
     fcf = np.nan
     if not np.isnan(ocf) and not np.isnan(capex):
         fcf = ocf - capex
 
-    # Balance sheet proxies
     cash = _latest_positive(bs, [
         "Cash And Cash Equivalents", "CashAndCashEquivalents", "Cash",
-        "Cash Cash Equivalents And Short Term Investments", "CashAndCashEquivalentsAndShortTermInvestments"
+        "Cash Cash Equivalents And Short Term Investments",
+        "CashAndCashEquivalentsAndShortTermInvestments"
     ])
+
     total_debt = _latest_positive(bs, [
         "Total Debt", "TotalDebt",
         "Long Term Debt", "LongTermDebt",
         "Long Term Debt And Capital Lease Obligation", "LongTermDebtAndCapitalLeaseObligation"
     ])
-    # Falls "Total Debt" fehlt, versuche Summe aus LT + ST
     if np.isnan(total_debt):
         lt = _latest_positive(bs, ["Long Term Debt", "LongTermDebt"])
-        st = _latest_positive(bs, ["Short Long Term Debt", "ShortLongTermDebt", "Short Term Debt", "ShortTermDebt"])
-        if not np.isnan(lt) or not np.isnan(st):
-            total_debt = (0.0 if np.isnan(lt) else lt) + (0.0 if np.isnan(st) else st)
+        st_debt = _latest_positive(bs, ["Short Long Term Debt", "ShortLongTermDebt", "Short Term Debt", "ShortTermDebt"])
+        if not np.isnan(lt) or not np.isnan(st_debt):
+            total_debt = (0.0 if np.isnan(lt) else lt) + (0.0 if np.isnan(st_debt) else st_debt)
 
     equity = _latest_positive(bs, [
         "Total Stockholder Equity", "TotalStockholderEquity",
@@ -459,7 +464,7 @@ def compute_kpi_fallbacks(info: dict, inc: pd.DataFrame, cf: pd.DataFrame, bs: p
         "Total Equity Gross Minority Interest", "TotalEquityGrossMinorityInterest"
     ])
 
-    # --- trailing P/E (proxy: Net income / shares)
+    # trailing P/E proxy
     trailing_pe_fb = np.nan
     if not np.isnan(price) and price > 0 and not np.isnan(net_income) and not np.isnan(shares) and shares > 0:
         eps = net_income / shares
@@ -467,42 +472,41 @@ def compute_kpi_fallbacks(info: dict, inc: pd.DataFrame, cf: pd.DataFrame, bs: p
             trailing_pe_fb = price / eps
     out["trailing_pe_fb"] = trailing_pe_fb
 
-    # --- P/S (mcap / revenue)
+    # P/S
     ps_fb = np.nan
     if not np.isnan(mcap) and mcap > 0 and not np.isnan(revenue) and revenue > 0:
         ps_fb = mcap / revenue
     out["ps_fb"] = ps_fb
 
-    # --- P/B (mcap / equity)
+    # P/B
     pb_fb = np.nan
     if not np.isnan(mcap) and mcap > 0 and not np.isnan(equity) and equity > 0:
         pb_fb = mcap / equity
     out["pb_fb"] = pb_fb
 
-    # --- FCF Yield (fcf / mcap)
+    # FCF yield
     fcf_yield_fb = np.nan
     if not np.isnan(fcf) and not np.isnan(mcap) and mcap > 0:
         fcf_yield_fb = fcf / mcap
     out["fcf_yield_fb"] = fcf_yield_fb
 
-    # --- Operating margin (op_income / revenue)
+    # Operating margin
     oper_margin_fb = np.nan
     if not np.isnan(op_income) and not np.isnan(revenue) and revenue != 0:
         oper_margin_fb = op_income / revenue
     out["oper_margin_fb"] = oper_margin_fb
 
-    # --- ROE (net_income / equity)
+    # ROE
     roe_fb = np.nan
     if not np.isnan(net_income) and not np.isnan(equity) and equity != 0:
         roe_fb = net_income / equity
     out["roe_fb"] = roe_fb
 
-    # --- Net debt / EBITDA
+    # Net debt / EBITDA
     nde_fb = np.nan
-    if not np.isnan(total_debt) or not np.isnan(cash):
+    if (not np.isnan(total_debt) or not np.isnan(cash)) and (not np.isnan(ebitda) and ebitda != 0):
         net_debt = (0.0 if np.isnan(total_debt) else total_debt) - (0.0 if np.isnan(cash) else cash)
-        if not np.isnan(ebitda) and ebitda != 0:
-            nde_fb = net_debt / ebitda
+        nde_fb = net_debt / ebitda
     out["net_debt_to_ebitda_fb"] = nde_fb
 
     return out
@@ -555,7 +559,8 @@ def score_risk(vals, sleeve):
     runway_score = z_to_01(runway, 0.0, 36.0)
 
     s = nanmean([vol_score, nde_score, runway_score])
-    if np.isnan(s): return np.nan
+    if np.isnan(s):
+        return np.nan
     risk = float(np.clip(s * 100, 0, 100))
     if not np.isnan(runway) and runway < 6:
         risk = min(risk, 35.0)
@@ -626,59 +631,72 @@ def compute_total_score(row: pd.Series):
     return float(np.clip(total, 0, 100)), subs, exp_g, impl_g, gap_raw
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BUILD ROW (Yahoo + Fallbacks)
+# BUILD ROW (Yahoo + robust fallbacks)
 # ─────────────────────────────────────────────────────────────────────────────
 def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
-    info = fetch_info(ticker)
-    hist = fetch_hist(ticker, "2y")
-    inc, cf, bs = fetch_financials(ticker)
+    rt = int(st.session_state.get("refresh_token", 0))
+
+    info = fetch_info(ticker, refresh_token=rt)
+    hist = fetch_hist(ticker, "2y", refresh_token=rt)
+    inc, cf, bs = fetch_financials(ticker, refresh_token=rt)
+
     mom, vol = calc_mom_vol(hist)
 
     sleeve = sleeve_choice if sleeve_choice in SLEEVES else "Auto"
     if sleeve == "Auto":
         sleeve = sleeve_auto_heuristic(info)
 
+    # PRICE: info -> fast_info -> history close
     price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    if np.isnan(price):
+        fi = (info.get("_fast_info") or {})
+        price = safe_float(fi.get("last_price") or fi.get("lastPrice"))
+    if np.isnan(price) and isinstance(hist, pd.DataFrame) and not hist.empty and "Close" in hist.columns:
+        cc = hist["Close"].dropna()
+        if len(cc) > 0:
+            price = safe_float(cc.iloc[-1])
+
+    # MARKET CAP: info -> fast_info -> shares*price
     mktcap = safe_float(info.get("marketCap"))
+    if np.isnan(mktcap):
+        fi = (info.get("_fast_info") or {})
+        mktcap = safe_float(fi.get("market_cap") or fi.get("marketCap"))
+    if np.isnan(mktcap):
+        shares = safe_float(info.get("sharesOutstanding"))
+        if not np.isnan(shares) and not np.isnan(price) and price > 0:
+            mktcap = shares * price
 
     # Raw Yahoo fields
     trailing_pe = safe_float(info.get("trailingPE"))
-    forward_pe = clean_forward_pe(info.get("forwardPE"))
-    peg = safe_float(info.get("pegRatio"))
-
+    forward_pe = clean_forward_pe(info.get("forwardPE"))     # estimate-abhängig
+    peg = safe_float(info.get("pegRatio"))                    # estimate-abhängig
     ps = safe_float(info.get("priceToSalesTrailing12Months"))
     pb = safe_float(info.get("priceToBook"))
     roe = safe_float(info.get("returnOnEquity"))
     oper_margin = safe_float(info.get("operatingMargins"))
     nde = safe_float(info.get("netDebtToEBITDA"))
 
-    # FCF yield via Yahoo direct
+    # FCF yield via Yahoo direct if present
     fcf = safe_float(info.get("freeCashflow"))
     fcf_y = np.nan
     if not np.isnan(fcf) and not np.isnan(mktcap) and mktcap > 0:
         fcf_y = fcf / mktcap
 
-    # Fallbacks aus Statements (nur wenn Yahoo missing/NaN)
+    # Statement-based fallbacks for missing KPIs
     fb = compute_kpi_fallbacks(info, inc, cf, bs, price=price, mcap=mktcap)
 
     if np.isnan(trailing_pe):
         trailing_pe = fb.get("trailing_pe_fb", np.nan)
-
     if np.isnan(ps):
         ps = fb.get("ps_fb", np.nan)
-
     if np.isnan(pb):
         pb = fb.get("pb_fb", np.nan)
-
     if np.isnan(fcf_y):
         fcf_y = fb.get("fcf_yield_fb", np.nan)
-
     if np.isnan(oper_margin):
         oper_margin = fb.get("oper_margin_fb", np.nan)
-
     if np.isnan(roe):
         roe = fb.get("roe_fb", np.nan)
-
     if np.isnan(nde):
         nde = fb.get("net_debt_to_ebitda_fb", np.nan)
 
@@ -692,8 +710,8 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
         "mktcap": mktcap,
 
         "trailing_pe": trailing_pe,
-        "forward_pe": forward_pe,   # bleibt estimate-abhängig
-        "peg": peg,                 # bleibt estimate-abhängig
+        "forward_pe": forward_pe,
+        "peg": peg,
 
         "ps": ps,
         "pb": pb,
@@ -718,14 +736,13 @@ def build_row(ticker: str, sleeve_choice: str, weight_pct: float):
     row["expectation_gap"] = gap_raw
     for k, v in subs.items():
         row[f"score_{k}"] = v
-
     return row
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BETA/CORR PANEL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_prices(tickers: list[str], period: str = "2y") -> pd.DataFrame:
+def fetch_prices(tickers: list[str], period: str = "2y"):
     data = yf.download(tickers=tickers, period=period, auto_adjust=True, progress=False)
     if data is None or len(data) == 0:
         return pd.DataFrame()
@@ -818,6 +835,10 @@ default_sleeve = st.sidebar.selectbox("Default Sleeve", SLEEVES, index=0)
 auto_normalize = st.sidebar.toggle("Weights automatisch auf 100% normalisieren", value=True)
 auto_fetch = st.sidebar.toggle("Yahoo Finance automatisch laden", value=True)
 run = st.sidebar.button("Load / Refresh", type="primary")
+
+# bump refresh token on load/refresh
+if run:
+    st.session_state["refresh_token"] += 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -922,6 +943,22 @@ m4.metric("Coverage", f"{int(df['shi_score'].notna().sum())}/{len(df)}" if "shi_
 st.dataframe(df[SHOW_COLS].sort_values("weight", ascending=False), use_container_width=True, hide_index=True)
 st.download_button("Download KPI Table (CSV)", df[SHOW_COLS].to_csv(index=False).encode("utf-8"), "shi_scorecard.csv", "text/csv")
 
+# Optional: Debug expander to see coverage
+with st.expander("Debug: Yahoo Coverage / fast_info", expanded=False):
+    dbg = []
+    rt = int(st.session_state.get("refresh_token", 0))
+    for tkr in df["ticker"].tolist():
+        ii = fetch_info(tkr, refresh_token=rt)
+        fi = ii.get("_fast_info") or {}
+        dbg.append({
+            "ticker": tkr,
+            "info_keys": len(ii.keys()) if isinstance(ii, dict) else 0,
+            "has_fast_info": bool(fi),
+            "fast_last_price": fi.get("last_price") if isinstance(fi, dict) else None,
+            "fast_market_cap": fi.get("market_cap") if isinstance(fi, dict) else None,
+        })
+    st.dataframe(pd.DataFrame(dbg), use_container_width=True, hide_index=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1011,7 +1048,7 @@ else:
     st.plotly_chart(fig, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5b) Beta / Correlation Panel vs S&P500 & DAX
+# 5b) Beta / Correlation Panel vs S&P 500 & DAX
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("5b) Beta / Correlation vs S&P 500 & DAX")
